@@ -68,8 +68,12 @@ configured rotation variance, and then gets a random yaw.
 
 Radial density falloff is independent of the profile curve. `0` leaves every
 viable site's carrying capacity unchanged; larger values progressively reduce
-how many grains edge sites can accept. Consumed sites leave the active frontier,
-so a fixed requested count can no longer refill a thinned edge. It has no hard
+how many grains edge sites can accept. Fractional capacity is stochastically
+rounded per blue-noise site, producing progressively wider gaps rather than a
+hard cutoff radius. Density-free sites remain part of site generation so the
+blue-noise frontier can still reach and sample the entire footprint; they are
+removed only before deposition. Consumed active sites leave the frontier, so a
+fixed requested count cannot refill a thinned edge. The control has no hard
 maximum. Extreme values can intentionally exhaust supported capacity before the
 requested grain count is reached.
 
@@ -101,14 +105,16 @@ not advance the seed.
 The script converts both controller curves into constant-time lookup tables,
 generates a Poisson-disk active set of viable deposition sites, and caches mesh
 raycasts per grain-sized terrain cell. The blue-noise site spacing avoids visible
-rows and columns while retaining fast frontier deposition. Cache reuse is limited
-to nearby samples, misses are never shared, and every accepted grain receives a
-final exact raycast before geometry is created. Targets with many disconnected
-shells—such as a base mesh combined with previous pours—also use exact initial
-hits. Cached tangent planes therefore remain search accelerators rather than
-authoritative final contacts. Terrain and vertical contact offsets use the
-rendered polyhedron's actual vertices instead of a larger smooth-ellipsoid
-approximation, reducing the small visible gaps that approximation could leave.
+rows and columns while retaining fast frontier deposition. Multiple global seeds
+ensure a capped site build covers the full controller instead of growing one
+solid disk outward from its center. Cache reuse is limited to nearby samples,
+misses are never shared, and every accepted grain receives a final exact raycast
+before geometry is created. Targets with many disconnected shells—such as a base
+mesh combined with previous pours—also use exact initial hits. Cached tangent
+planes therefore remain search accelerators rather than authoritative final
+contacts. Terrain and vertical contact offsets use the rendered polyhedron's
+actual vertices instead of a larger smooth-ellipsoid approximation, reducing the
+small visible gaps that approximation could leave.
 The standard defaults use softened 20-face grains. Disable **High-detail grains**
 and **Soften grain edges** for a faster preview. Disable terrain caching only when
 the target has features smaller than a grain that need exact per-grain projection.
