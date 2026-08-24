@@ -215,6 +215,7 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "packingTightness", "double", 0.94, 0.80, 1.05)
     _add_attr(SIZE_CTRL, "settlingIterations", "long", 5, 0, 20)
     _add_attr(SIZE_CTRL, "settlingRadius", "double", 1.25, 0.0, 4.0)
+    _add_attr(SIZE_CTRL, "maxSupportSlope", "double", 60.0, 0.0, 89.0)
     _add_attr(SIZE_CTRL, "spillBalance", "double", 0.60, 0.0, 1.0)
     _add_attr(SIZE_CTRL, "useWorldGravity", "bool", 1)
     _add_attr(SIZE_CTRL, "proposalBatchSize", "long", 4, 1, 16)
@@ -598,6 +599,7 @@ def build_sand_heap():
     packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
     settling_iterations = int(cmds.getAttr(SIZE_CTRL + ".settlingIterations"))
     settling_radius = float(cmds.getAttr(SIZE_CTRL + ".settlingRadius"))
+    max_support_slope = float(cmds.getAttr(SIZE_CTRL + ".maxSupportSlope"))
     spill_balance = float(cmds.getAttr(SIZE_CTRL + ".spillBalance"))
     use_world_gravity = bool(cmds.getAttr(SIZE_CTRL + ".useWorldGravity"))
     proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
@@ -650,6 +652,13 @@ def build_sand_heap():
 
         mesh_fn = om.MFnMesh(_dag_path(target_shape))
         accel = mesh_fn.autoUniformGridParams()
+        try:
+            target_shell_count = int(
+                cmds.polyEvaluate(target_shape, shell=True) or 1
+            )
+        except RuntimeError:
+            target_shell_count = 1
+        composite_target = target_shell_count > 8
         target_bbox = cmds.exactWorldBoundingBox(target_transform)
         diagonal = math.sqrt(
             (target_bbox[3] - target_bbox[0]) ** 2
@@ -665,11 +674,14 @@ def build_sand_heap():
         )
         cell_size = max(max_horizontal_radius * 2.0, 1.0e-6)
         projection_cell_size = max(grain_size * 1.25, 1.0e-6)
+        cache_reuse_radius_sq = (grain_size * 0.45) ** 2
+        minimum_support_normal = math.cos(math.radians(max_support_slope))
         base_vertices, _ = _grain_polyhedron(high_detail)
         axis_extents = tuple(
             max(abs(vertex[axis]) for vertex in base_vertices)
             for axis in range(3)
         )
+        inverse_axis_extents = tuple(1.0 / extent for extent in axis_extents)
         vertical_extent = axis_extents[1]
         minimum_vertical_radius = (
             grain_size * (1.0 - size_variation) * flattening * vertical_extent
@@ -840,10 +852,36 @@ def build_sand_heap():
         spatial_hash = {}
         projection_cache = {}
         cache_miss = object()
-        placement_stats = {"raycasts": 0, "cache_hits": 0, "settled": 0}
+        placement_stats = {
+            "raycasts": 0,
+            "forced_raycasts": 0,
+            "cache_hits": 0,
+            "settled": 0,
+            "steep_rejects": 0,
+            "exact_rejects": 0,
+        }
 
-        def project_surface(x, z):
-            """Project a controller-plane point and reuse local tangent data."""
+        def grain_mesh_support_radius(direction, axes, radii):
+            """Exact support distance of the rendered grain polyhedron."""
+            direction = om.MVector(direction).normalize()
+            projections = tuple(axis * direction for axis in axes)
+            scales = tuple(
+                radius * inverse_extent
+                for radius, inverse_extent in zip(
+                    radii, inverse_axis_extents
+                )
+            )
+            return max(
+                abs(
+                    vertex[0] * scales[0] * projections[0]
+                    + vertex[1] * scales[1] * projections[1]
+                    + vertex[2] * scales[2] * projections[2]
+                )
+                for vertex in base_vertices
+            )
+
+        def project_surface(x, z, force_exact=False):
+            """Project a controller-plane point, optionally bypassing the cache."""
             plane_point = om.MPoint(x, 0.0, z) * world_matrix
             point_vector = om.MVector(
                 plane_point.x, plane_point.y, plane_point.z
@@ -858,14 +896,29 @@ def build_sand_heap():
                 int(math.floor(horizontal_u / projection_cell_size)),
                 int(math.floor(horizontal_v / projection_cell_size)),
             )
-            cached_projection = (
-                projection_cache.get(projection_cell, cache_miss)
-                if use_projection_cache
-                else cache_miss
-            )
+            used_cached_projection = False
+            if force_exact or not use_projection_cache:
+                cached_projection = cache_miss
+            else:
+                cached_projection = projection_cache.get(
+                    projection_cell, cache_miss
+                )
+                if cached_projection is not cache_miss:
+                    sample_u = cached_projection[2]
+                    sample_v = cached_projection[3]
+                    cache_delta_u = horizontal_u - sample_u
+                    cache_delta_v = horizontal_v - sample_v
+                    if (
+                        cache_delta_u * cache_delta_u
+                        + cache_delta_v * cache_delta_v
+                        > cache_reuse_radius_sq
+                    ):
+                        cached_projection = cache_miss
             if cached_projection is cache_miss:
                 ray_source = plane_point + projection_up * ray_offset
                 placement_stats["raycasts"] += 1
+                if force_exact:
+                    placement_stats["forced_raycasts"] += 1
                 try:
                     hit = mesh_fn.closestIntersection(
                         om.MFloatPoint(ray_source),
@@ -883,12 +936,12 @@ def build_sand_heap():
                     sample_point = om.MPoint(hit[0])
                     face_id = hit[2]
                     try:
-                        surface_normal, _ = mesh_fn.getClosestNormal(
-                            sample_point, om.MSpace.kWorld
-                        )
-                    except (RuntimeError, TypeError):
                         surface_normal = mesh_fn.getPolygonNormal(
                             face_id, om.MSpace.kWorld
+                        )
+                    except RuntimeError:
+                        surface_normal, _ = mesh_fn.getClosestNormal(
+                            sample_point, om.MSpace.kWorld
                         )
                     surface_normal = om.MVector(surface_normal).normalize()
                     if surface_normal * gravity_up < 0.0:
@@ -896,22 +949,32 @@ def build_sand_heap():
                     cached_projection = (
                         (sample_point.x, sample_point.y, sample_point.z),
                         (surface_normal.x, surface_normal.y, surface_normal.z),
+                        horizontal_u,
+                        horizontal_v,
                     )
-                if use_projection_cache:
+                # Do not cache misses: a nearby ray can still hit a small grain
+                # or a different shell inside the same projection cell.
+                if use_projection_cache and cached_projection is not None:
                     projection_cache[projection_cell] = cached_projection
             else:
                 placement_stats["cache_hits"] += 1
+                used_cached_projection = True
 
             if cached_projection is None:
                 return None
-            sample_components, normal_components = cached_projection
+            sample_components, normal_components, _, _ = cached_projection
             sample_point = om.MPoint(*sample_components)
             surface_normal = om.MVector(*normal_components).normalize()
             projection_dot = surface_normal * projection_up
             normal_up = surface_normal * gravity_up
             if abs(projection_dot) < 1.0e-5:
+                if used_cached_projection:
+                    return project_surface(x, z, force_exact=True)
                 return None
-            if normal_up < 1.0e-5:
+            if normal_up < minimum_support_normal:
+                if used_cached_projection:
+                    return project_surface(x, z, force_exact=True)
+                placement_stats["steep_rejects"] += 1
                 return None
             sample_delta = sample_point - plane_point
             plane_parameter = (
@@ -945,7 +1008,7 @@ def build_sand_heap():
                 return None
 
             surface_normal = projection["surface_normal"]
-            terrain_support = _ellipsoid_support_radius(
+            terrain_support = grain_mesh_support_radius(
                 surface_normal, axes, radii
             )
             terrain_elevation = projection["ground_elevation"] + (
@@ -1086,7 +1149,12 @@ def build_sand_heap():
                 _mark_frontier_failure(frontier, site_index, retire_after=4)
                 continue
 
-            initial_projection = project_surface(x, z)
+            # Multi-shell targets are typical of recursive pours. Their height
+            # can jump from one grain to the next inside a cache cell, so the
+            # first hit must be exact rather than a tangent-plane estimate.
+            initial_projection = project_surface(
+                x, z, force_exact=composite_target
+            )
             if initial_projection is None:
                 consecutive_failures += 1
                 _mark_frontier_failure(frontier, site_index, retire_after=3)
@@ -1106,7 +1174,7 @@ def build_sand_heap():
                 radius * flattening * axis_extents[1],
                 radius / stretch * axis_extents[2],
             )
-            vertical_support = _ellipsoid_support_radius(
+            vertical_support = grain_mesh_support_radius(
                 gravity_up, axes, radii
             )
             placement = evaluate_drop(
@@ -1187,7 +1255,6 @@ def build_sand_heap():
                 continue
 
             if moved_during_settling:
-                placement_stats["settled"] += 1
                 # Re-align the final grain to the normal where it actually
                 # settled, then keep that refinement only if support remains
                 # valid with the updated orientation.
@@ -1195,7 +1262,7 @@ def build_sand_heap():
                     placement["surface_normal"], rotation_variance, rng
                 )
                 refined_axes = _oriented_grain_axes(refined_normal, yaw)
-                refined_vertical = _ellipsoid_support_radius(
+                refined_vertical = grain_mesh_support_radius(
                     gravity_up, refined_axes, radii
                 )
                 refined_placement = evaluate_drop(
@@ -1212,6 +1279,48 @@ def build_sand_heap():
                     axes = refined_axes
                     vertical_support = refined_vertical
                     placement = refined_placement
+
+            # Cached tangent planes are useful search hints but are not trusted
+            # as final terrain contacts. Re-raycast the accepted position,
+            # realign to its exact normal, and recompute every support constraint
+            # before adding geometry. This prevents discontinuous grain shells
+            # from donating their height to nearby gaps or lower surfaces.
+            exact_projection = project_surface(
+                placement["x"], placement["z"], force_exact=True
+            )
+            if exact_projection is None:
+                placement_stats["exact_rejects"] += 1
+                consecutive_failures += 1
+                _mark_frontier_failure(frontier, site_index, retire_after=12)
+                continue
+            exact_normal = _randomized_normal(
+                exact_projection["surface_normal"], rotation_variance, rng
+            )
+            exact_axes = _oriented_grain_axes(exact_normal, yaw)
+            exact_vertical = grain_mesh_support_radius(
+                gravity_up, exact_axes, radii
+            )
+            exact_placement = evaluate_drop(
+                placement["x"],
+                placement["z"],
+                exact_axes,
+                radii,
+                exact_vertical,
+                projection=exact_projection,
+            )
+            if exact_placement is None or (
+                settling_iterations > 0 and not exact_placement["stable"]
+            ):
+                placement_stats["exact_rejects"] += 1
+                consecutive_failures += 1
+                _mark_frontier_failure(frontier, site_index, retire_after=12)
+                continue
+            grain_normal = exact_normal
+            axes = exact_axes
+            vertical_support = exact_vertical
+            placement = exact_placement
+            if moved_during_settling:
+                placement_stats["settled"] += 1
             grains.append(
                 (
                     placement["center"],
@@ -1290,15 +1399,24 @@ def build_sand_heap():
 
         cmds.select(SIZE_CTRL, replace=True)
         message = (
-            "Built {:,} grains on {} with seed {}; {:,} settled, {:,} raycasts, {:,} cached projections"
+            "Built {:,} grains on {} with seed {}; {:,} settled, {:,} raycasts "
+            "({:,} forced), {:,} cached projections, {:,} exact-contact rejects, "
+            "{:,} steep-facet rejects"
         ).format(
             len(grains),
             target_transform,
             seed,
             placement_stats["settled"],
             placement_stats["raycasts"],
+            placement_stats["forced_raycasts"],
             placement_stats["cache_hits"],
+            placement_stats["exact_rejects"],
+            placement_stats["steep_rejects"],
         )
+        if composite_target:
+            message += "; composite target detected ({:,} shells)".format(
+                target_shell_count
+            )
         if auto_increment_seed:
             message += "; next seed is {}".format(next_seed)
         if len(grains) < count:
@@ -1393,6 +1511,14 @@ def _set_settling_radius(value):
         )
 
 
+def _set_max_support_slope(value):
+    if cmds.objExists(SIZE_CTRL + ".maxSupportSlope"):
+        cmds.setAttr(
+            SIZE_CTRL + ".maxSupportSlope",
+            max(0.0, min(float(value), 89.0)),
+        )
+
+
 def _set_spill_balance(value):
     if cmds.objExists(SIZE_CTRL + ".spillBalance"):
         cmds.setAttr(
@@ -1462,6 +1588,7 @@ def _show_control_window():
     packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
     settling_iterations = int(cmds.getAttr(SIZE_CTRL + ".settlingIterations"))
     settling_radius = float(cmds.getAttr(SIZE_CTRL + ".settlingRadius"))
+    max_support_slope = float(cmds.getAttr(SIZE_CTRL + ".maxSupportSlope"))
     spill_balance = float(cmds.getAttr(SIZE_CTRL + ".spillBalance"))
     use_world_gravity = bool(cmds.getAttr(SIZE_CTRL + ".useWorldGravity"))
     proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
@@ -1475,7 +1602,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 820),
+        widthHeight=(420, 860),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1615,6 +1742,19 @@ def _show_control_window():
         precision=2,
         dragCommand=_set_settling_radius,
         changeCommand=_set_settling_radius,
+    )
+    cmds.floatSliderGrp(
+        label="Max Support Slope",
+        field=True,
+        minValue=0.0,
+        maxValue=89.0,
+        fieldMinValue=0.0,
+        fieldMaxValue=89.0,
+        value=max_support_slope,
+        step=1.0,
+        precision=1,
+        dragCommand=_set_max_support_slope,
+        changeCommand=_set_max_support_slope,
     )
     cmds.floatSliderGrp(
         label="Spill Balance",

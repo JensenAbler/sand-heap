@@ -49,6 +49,7 @@ so it does not need to remain selected.
 | `packingTightness` | Contact spacing; values below 1 add slight visual overlap |
 | `settlingIterations` | Number of lateral drop-and-relax search passes |
 | `settlingRadius` | Initial lateral search distance in grain-size units |
+| `maxSupportSlope` | Steepest target facet that may support a grain |
 | `spillBalance` | Resist one-sided avalanches by penalizing overfilled radial sectors |
 | `useWorldGravity` | Settle vertically in world space instead of along the controller normal |
 | `proposalBatchSize` | Number of randomized active sites compared per placement |
@@ -78,6 +79,12 @@ a pocket supported by at least two neighboring grains. Unsupported single-contac
 balance points are rejected rather than becoming vertical columns. Set Settling
 Passes to `0` for the older, faster first-support behavior.
 
+**Max Support Slope** defaults to `60` degrees. Steeper hits are usually grain
+sidewalls or near-vertical facets rather than stable resting surfaces. Rejecting
+them also prevents the normal-based contact offset from becoming excessively
+large as a facet approaches vertical. Raise the limit for unusually steep target
+terrain, or lower it when recursive pours still catch too many grain sidewalls.
+
 World-gravity settling removes controller-tilt bias on hills. **Spill Balance**
 then discourages a small random advantage from turning into a completely
 one-sided avalanche; `0` disables that correction and `1` applies its strongest
@@ -94,9 +101,14 @@ not advance the seed.
 The script converts both controller curves into constant-time lookup tables,
 generates a Poisson-disk active set of viable deposition sites, and caches mesh
 raycasts per grain-sized terrain cell. The blue-noise site spacing avoids visible
-rows and columns while retaining fast frontier deposition. Cached hits use the
-sampled tangent plane, so nearby grains still follow local slope instead of
-sharing a flat elevation.
+rows and columns while retaining fast frontier deposition. Cache reuse is limited
+to nearby samples, misses are never shared, and every accepted grain receives a
+final exact raycast before geometry is created. Targets with many disconnected
+shells—such as a base mesh combined with previous pours—also use exact initial
+hits. Cached tangent planes therefore remain search accelerators rather than
+authoritative final contacts. Terrain and vertical contact offsets use the
+rendered polyhedron's actual vertices instead of a larger smooth-ellipsoid
+approximation, reducing the small visible gaps that approximation could leave.
 The standard defaults use softened 20-face grains. Disable **High-detail grains**
 and **Soften grain edges** for a faster preview. Disable terrain caching only when
 the target has features smaller than a grain that need exact per-grain projection.
