@@ -40,7 +40,7 @@ so it does not need to remain selected.
 | `grainSizeVariation` | Random size variation |
 | `grainFlattening` | Vertical grain scale |
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
-| `radialDensityFalloff` | Bias placement density from the center toward the edge |
+| `radialDensityFalloff` | Reduce supported grain capacity from the center toward the edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
 | `seed` | Random seed used by the next rebuild |
 | `autoIncrementSeed` | Advance the seed after each successful rebuild |
@@ -49,27 +49,40 @@ so it does not need to remain selected.
 | `packingTightness` | Contact spacing; values below 1 add slight visual overlap |
 | `settlingIterations` | Number of lateral drop-and-relax search passes |
 | `settlingRadius` | Initial lateral search distance in grain-size units |
+| `spillBalance` | Resist one-sided avalanches by penalizing overfilled radial sectors |
+| `useWorldGravity` | Settle vertically in world space instead of along the controller normal |
+| `proposalBatchSize` | Number of randomized active sites compared per placement |
 | `highDetailGrains` | Use 20-face grains instead of the faster 8-face grains |
 | `softEdges` | Run Maya's soft-edge operation on the combined output |
 | `showProgress` | Show interruptible progress windows for each build phase |
 
-The size controller's local `-Y` axis is the projection direction. Rotate the
-controller when working on sloped or unusually oriented surfaces. Scaling the
-size controller also scales the generated grains. For non-uniform X/Z scaling,
-the script uses the geometric mean of those two scale factors for grain size.
-Grain orientation begins at the target normal, receives up to the configured
-rotation variance, and then gets a random yaw.
+The size controller's local `-Y` axis remains the mesh-projection direction, so
+it can be aimed at sloped or unusually oriented surfaces. Settling uses world
+gravity by default, independently of that projection direction. Disable **Settle
+using world gravity** to use the controller normal for both operations. Scaling
+the size controller also scales the generated grains. For non-uniform X/Z
+scaling, the script uses the geometric mean of those two scale factors for grain
+size. Grain orientation begins at the target normal, receives up to the
+configured rotation variance, and then gets a random yaw.
 
-Radial density falloff is independent of the profile curve. `0` distributes
-placement attempts uniformly across viable sites; larger values increasingly
-favor the center. It has no hard maximum; the profile curve still defines the
-maximum supported height.
+Radial density falloff is independent of the profile curve. `0` leaves every
+viable site's carrying capacity unchanged; larger values progressively reduce
+how many grains edge sites can accept. Consumed sites leave the active frontier,
+so a fixed requested count can no longer refill a thinned edge. It has no hard
+maximum. Extreme values can intentionally exhaust supported capacity before the
+requested grain count is reached.
 
 Packing uses a drop-and-relax approximation. Ground grains stop on the sampled
 terrain; raised grains search laterally for a lower position and must finish in
 a pocket supported by at least two neighboring grains. Unsupported single-contact
 balance points are rejected rather than becoming vertical columns. Set Settling
 Passes to `0` for the older, faster first-support behavior.
+
+World-gravity settling removes controller-tilt bias on hills. **Spill Balance**
+then discourages a small random advantage from turning into a completely
+one-sided avalanche; `0` disables that correction and `1` applies its strongest
+sector balancing. Proposal Batch compares several randomized deposition sites
+before each drop, reducing sequential first-mover sensitivity at a modest cost.
 
 Seed auto-increment is enabled by default. A successful rebuild uses the seed
 shown in the control window and then advances it for the next run. Disable the

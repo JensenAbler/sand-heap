@@ -215,6 +215,9 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "packingTightness", "double", 0.94, 0.80, 1.05)
     _add_attr(SIZE_CTRL, "settlingIterations", "long", 5, 0, 20)
     _add_attr(SIZE_CTRL, "settlingRadius", "double", 1.25, 0.0, 4.0)
+    _add_attr(SIZE_CTRL, "spillBalance", "double", 0.60, 0.0, 1.0)
+    _add_attr(SIZE_CTRL, "useWorldGravity", "bool", 1)
+    _add_attr(SIZE_CTRL, "proposalBatchSize", "long", 4, 1, 16)
     _add_attr(SIZE_CTRL, "highDetailGrains", "bool", 1)
     _add_attr(SIZE_CTRL, "softEdges", "bool", 1)
     _add_attr(SIZE_CTRL, "showProgress", "bool", 1)
@@ -595,6 +598,9 @@ def build_sand_heap():
     packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
     settling_iterations = int(cmds.getAttr(SIZE_CTRL + ".settlingIterations"))
     settling_radius = float(cmds.getAttr(SIZE_CTRL + ".settlingRadius"))
+    spill_balance = float(cmds.getAttr(SIZE_CTRL + ".spillBalance"))
+    use_world_gravity = bool(cmds.getAttr(SIZE_CTRL + ".useWorldGravity"))
+    proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
     show_progress = bool(cmds.getAttr(SIZE_CTRL + ".showProgress"))
@@ -629,13 +635,18 @@ def build_sand_heap():
         scale_z = max(controller_z_vector.length(), 1.0e-8)
         horizontal_scale = math.sqrt(scale_x * scale_z)
         grain_size = base_grain_size * horizontal_scale
-        controller_up = (om.MVector(0, 1, 0) * world_matrix).normalize()
+        projection_up = (om.MVector(0, 1, 0) * world_matrix).normalize()
+        gravity_up = (
+            om.MVector(0, 1, 0)
+            if use_world_gravity
+            else om.MVector(projection_up)
+        )
         controller_u = om.MVector(controller_x_vector)
-        controller_u -= controller_up * (controller_u * controller_up)
+        controller_u -= gravity_up * (controller_u * gravity_up)
         if controller_u.length() < 1.0e-8:
-            controller_u = om.MVector(0, 0, 1) ^ controller_up
+            controller_u = om.MVector(0, 0, 1) ^ gravity_up
         controller_u.normalize()
-        controller_v = (controller_up ^ controller_u).normalize()
+        controller_v = (gravity_up ^ controller_u).normalize()
 
         mesh_fn = om.MFnMesh(_dag_path(target_shape))
         accel = mesh_fn.autoUniformGridParams()
@@ -674,6 +685,30 @@ def build_sand_heap():
         poisson_grid = {}
         poisson_active = []
 
+        sector_count = 12
+        sector_populations = [0] * sector_count
+
+        def radial_sector(x, z):
+            angle = math.atan2(z, x)
+            if angle < 0.0:
+                angle += math.pi * 2.0
+            return min(
+                int(angle * sector_count / (math.pi * 2.0)),
+                sector_count - 1,
+            )
+
+        def sector_excess(sector):
+            expected = max(float(len(grains)) / sector_count, 1.0)
+            return max(0.0, sector_populations[sector] - expected) / expected
+
+        def balance_penalty(x, z):
+            return (
+                spill_balance
+                * grain_size
+                * 3.0
+                * sector_excess(radial_sector(x, z))
+            )
+
         def make_site(x, z):
             if x < min_x or x > max_x or z < min_z or z > max_z:
                 return None
@@ -683,31 +718,43 @@ def build_sand_heap():
             relative_height = max(
                 0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
             ) ** falloff_power
-            if heap_height * relative_height < minimum_vertical_radius * 2.0:
+            local_height = heap_height * relative_height
+            layer_height = max(minimum_vertical_radius * 2.0, 1.0e-8)
+            if local_height < layer_height:
+                return None
+            density_weight = max(
+                (1.0 - radius_fraction) ** radial_density_falloff,
+                1.0e-12,
+            )
+            # Density is a capacity multiplier, not merely a selection bias.
+            # Once a site's allowance is consumed it leaves the frontier, so a
+            # requested fixed count cannot refill a thinned edge later.
+            max_uses = int(math.floor(local_height / layer_height * density_weight + 0.5))
+            if max_uses < 1:
                 return None
             return {
                 "x": x,
                 "z": z,
                 "site_u": x * scale_x,
                 "site_v": z * scale_z,
-                "density_weight": max(
-                    (1.0 - radius_fraction) ** radial_density_falloff,
-                    1.0e-6,
-                ),
+                "density_weight": density_weight,
+                "max_uses": max_uses,
+                "sector": radial_sector(x, z),
                 "uses": 0,
                 "failures": 0,
             }
 
-        # Begin from a random viable point so even the Poisson seed does not
-        # create a persistent center-origin signature between rebuilds.
-        first_site = None
-        for _ in range(2000):
-            first_site = make_site(
-                rng.uniform(min_x, max_x),
-                rng.uniform(min_z, max_z),
-            )
-            if first_site is not None:
-                break
+        # A center seed guarantees that very strong radial falloff still has a
+        # viable origin from which the blue-noise frontier can grow.
+        first_site = make_site(0.0, 0.0)
+        if first_site is None:
+            for _ in range(2000):
+                first_site = make_site(
+                    rng.uniform(min_x, max_x),
+                    rng.uniform(min_z, max_z),
+                )
+                if first_site is not None:
+                    break
         if first_site is not None:
             frontier.append(first_site)
             poisson_active.append(0)
@@ -817,12 +864,12 @@ def build_sand_heap():
                 else cache_miss
             )
             if cached_projection is cache_miss:
-                ray_source = plane_point + controller_up * ray_offset
+                ray_source = plane_point + projection_up * ray_offset
                 placement_stats["raycasts"] += 1
                 try:
                     hit = mesh_fn.closestIntersection(
                         om.MFloatPoint(ray_source),
-                        om.MFloatVector(-controller_up),
+                        om.MFloatVector(-projection_up),
                         om.MSpace.kWorld,
                         max_ray_distance,
                         False,
@@ -844,7 +891,7 @@ def build_sand_heap():
                             face_id, om.MSpace.kWorld
                         )
                     surface_normal = om.MVector(surface_normal).normalize()
-                    if surface_normal * controller_up < 0.0:
+                    if surface_normal * gravity_up < 0.0:
                         surface_normal *= -1.0
                     cached_projection = (
                         (sample_point.x, sample_point.y, sample_point.z),
@@ -860,20 +907,23 @@ def build_sand_heap():
             sample_components, normal_components = cached_projection
             sample_point = om.MPoint(*sample_components)
             surface_normal = om.MVector(*normal_components).normalize()
-            normal_up = surface_normal * controller_up
+            projection_dot = surface_normal * projection_up
+            normal_up = surface_normal * gravity_up
+            if abs(projection_dot) < 1.0e-5:
+                return None
             if normal_up < 1.0e-5:
                 return None
             sample_delta = sample_point - plane_point
             plane_parameter = (
                 om.MVector(sample_delta) * surface_normal
-            ) / normal_up
-            hit_point = plane_point + controller_up * plane_parameter
+            ) / projection_dot
+            hit_point = plane_point + projection_up * plane_parameter
             hit_vector = om.MVector(hit_point.x, hit_point.y, hit_point.z)
             return {
                 "hit_point": hit_point,
                 "surface_normal": surface_normal,
                 "normal_up": normal_up,
-                "ground_elevation": hit_vector * controller_up,
+                "ground_elevation": hit_vector * gravity_up,
                 "u": horizontal_u,
                 "v": horizontal_v,
                 "cell": cell,
@@ -954,7 +1004,7 @@ def build_sand_heap():
                 if kind == "neighbor"
                 and support_elevation - value <= contact_tolerance
             )
-            center = projection["hit_point"] + controller_up * (
+            center = projection["hit_point"] + gravity_up * (
                 support_elevation - projection["ground_elevation"]
             )
             return {
@@ -969,6 +1019,7 @@ def build_sand_heap():
                 "neighbor_contacts": neighbor_contacts,
                 "stable": terrain_contact or neighbor_contacts >= 2,
                 "surface_normal": surface_normal,
+                "sector": radial_sector(x, z),
             }
 
         attempts = 0
@@ -991,23 +1042,29 @@ def build_sand_heap():
                 )
                 return None
 
-            # Two-choice weighted selection applies radial density falloff
-            # without a global rejection loop or mutable weighted index.
+            # Compare a small randomized proposal batch. This reduces the
+            # first-mover sensitivity of strictly sequential deposition while
+            # retaining the active-frontier solver's speed.
             site_index = rng.randrange(len(frontier))
-            if len(frontier) > 1:
-                alternate_index = rng.randrange(len(frontier))
-                first_score = (
-                    frontier[site_index]["density_weight"]
-                    * rng.random()
-                    / ((1.0 + frontier[site_index]["uses"]) ** 1.5)
+            best_site_score = -1.0
+            for _ in range(min(proposal_batch_size, len(frontier))):
+                proposal_index = rng.randrange(len(frontier))
+                proposal = frontier[proposal_index]
+                balance_weight = 1.0 / (
+                    1.0
+                    + spill_balance
+                    * 4.0
+                    * sector_excess(proposal["sector"])
                 )
-                alternate_score = (
-                    frontier[alternate_index]["density_weight"]
+                proposal_score = (
+                    proposal["density_weight"]
+                    * balance_weight
                     * rng.random()
-                    / ((1.0 + frontier[alternate_index]["uses"]) ** 1.5)
+                    / ((1.0 + proposal["uses"]) ** 1.5)
                 )
-                if alternate_score > first_score:
-                    site_index = alternate_index
+                if proposal_score > best_site_score:
+                    site_index = proposal_index
+                    best_site_score = proposal_score
             site = frontier[site_index]
             jitter_angle = rng.uniform(0.0, math.pi * 2.0)
             jitter_distance = (
@@ -1050,7 +1107,7 @@ def build_sand_heap():
                 radius / stretch * axis_extents[2],
             )
             vertical_support = _ellipsoid_support_radius(
-                controller_up, axes, radii
+                gravity_up, axes, radii
             )
             placement = evaluate_drop(
                 x,
@@ -1077,6 +1134,10 @@ def build_sand_heap():
                         break
                     phase = rng.uniform(0.0, math.pi * 2.0)
                     best = placement
+                    best_energy = (
+                        best["center_elevation"]
+                        + balance_penalty(best["x"], best["z"])
+                    )
                     for direction_index in range(8):
                         angle = phase + math.pi * 2.0 * direction_index / 8.0
                         trial = evaluate_drop(
@@ -1090,10 +1151,11 @@ def build_sand_heap():
                         )
                         if trial is None:
                             continue
-                        height_delta = (
+                        trial_energy = (
                             trial["center_elevation"]
-                            - best["center_elevation"]
+                            + balance_penalty(trial["x"], trial["z"])
                         )
+                        height_delta = trial_energy - best_energy
                         better_height = height_delta < -grain_size * 0.025
                         similar_height = abs(height_delta) <= grain_size * 0.025
                         better_support = (
@@ -1107,6 +1169,7 @@ def build_sand_heap():
                         )
                         if better_height or better_support:
                             best = trial
+                            best_energy = trial_energy
                     if best is placement:
                         continue
                     placement = best
@@ -1133,7 +1196,7 @@ def build_sand_heap():
                 )
                 refined_axes = _oriented_grain_axes(refined_normal, yaw)
                 refined_vertical = _ellipsoid_support_radius(
-                    controller_up, refined_axes, radii
+                    gravity_up, refined_axes, radii
                 )
                 refined_placement = evaluate_drop(
                     placement["x"],
@@ -1169,8 +1232,13 @@ def build_sand_heap():
                     "radii": radii,
                 }
             )
+            sector_populations[placement["sector"]] += 1
             site["uses"] += 1
-            site["failures"] = 0
+            if site["uses"] >= site["max_uses"]:
+                frontier[site_index] = frontier[-1]
+                frontier.pop()
+            else:
+                site["failures"] = 0
             consecutive_failures = 0
 
             now = time.perf_counter()
@@ -1325,6 +1393,27 @@ def _set_settling_radius(value):
         )
 
 
+def _set_spill_balance(value):
+    if cmds.objExists(SIZE_CTRL + ".spillBalance"):
+        cmds.setAttr(
+            SIZE_CTRL + ".spillBalance",
+            max(0.0, min(float(value), 1.0)),
+        )
+
+
+def _set_world_gravity(value):
+    if cmds.objExists(SIZE_CTRL + ".useWorldGravity"):
+        cmds.setAttr(SIZE_CTRL + ".useWorldGravity", bool(value))
+
+
+def _set_proposal_batch_size(value):
+    if cmds.objExists(SIZE_CTRL + ".proposalBatchSize"):
+        cmds.setAttr(
+            SIZE_CTRL + ".proposalBatchSize",
+            max(1, min(int(value), 16)),
+        )
+
+
 def _set_projection_cache(value):
     if cmds.objExists(SIZE_CTRL + ".useProjectionCache"):
         cmds.setAttr(SIZE_CTRL + ".useProjectionCache", bool(value))
@@ -1373,6 +1462,9 @@ def _show_control_window():
     packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
     settling_iterations = int(cmds.getAttr(SIZE_CTRL + ".settlingIterations"))
     settling_radius = float(cmds.getAttr(SIZE_CTRL + ".settlingRadius"))
+    spill_balance = float(cmds.getAttr(SIZE_CTRL + ".spillBalance"))
+    use_world_gravity = bool(cmds.getAttr(SIZE_CTRL + ".useWorldGravity"))
+    proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
@@ -1383,7 +1475,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 700),
+        widthHeight=(420, 820),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1524,6 +1616,36 @@ def _show_control_window():
         dragCommand=_set_settling_radius,
         changeCommand=_set_settling_radius,
     )
+    cmds.floatSliderGrp(
+        label="Spill Balance",
+        field=True,
+        minValue=0.0,
+        maxValue=1.0,
+        fieldMinValue=0.0,
+        fieldMaxValue=1.0,
+        value=spill_balance,
+        step=0.05,
+        precision=2,
+        dragCommand=_set_spill_balance,
+        changeCommand=_set_spill_balance,
+    )
+    cmds.intSliderGrp(
+        label="Proposal Batch",
+        field=True,
+        minValue=1,
+        maxValue=16,
+        fieldMinValue=1,
+        fieldMaxValue=16,
+        value=proposal_batch_size,
+        step=1,
+        dragCommand=_set_proposal_batch_size,
+        changeCommand=_set_proposal_batch_size,
+    )
+    cmds.checkBox(
+        label="Settle using world gravity",
+        value=use_world_gravity,
+        changeCommand=_set_world_gravity,
+    )
     cmds.separator(style="in", height=8)
     cmds.checkBox(
         label="Cache terrain projections (faster)",
@@ -1546,7 +1668,7 @@ def _show_control_window():
         changeCommand=_set_show_progress,
     )
     cmds.text(
-        label="Rotation variance is maximum tilt from the target surface normal.",
+        label="Spill balance resists one-sided avalanches on ridges and hills.",
         align="left",
     )
     cmds.showWindow(window)
