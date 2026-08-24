@@ -195,7 +195,17 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "grainSizeVariation", "double", 0.30, 0.0, 0.95)
     _add_attr(SIZE_CTRL, "grainFlattening", "double", 0.68, 0.1, 2.0)
     _add_attr(SIZE_CTRL, "rotationVariance", "double", 12.0, 0.0, 90.0)
-    _add_attr(SIZE_CTRL, "radialDensityFalloff", "double", 1.0, 0.0, 8.0)
+    _add_attr(SIZE_CTRL, "radialDensityFalloff", "double", 1.0, 0.0)
+    # Older versions imposed an arbitrary maximum of 8. Remove it in-place so
+    # existing scene controllers gain the uncapped behavior too.
+    try:
+        cmds.addAttr(
+            SIZE_CTRL + ".radialDensityFalloff",
+            edit=True,
+            hasMaxValue=False,
+        )
+    except RuntimeError:
+        pass
     _add_attr(SIZE_CTRL, "falloffPower", "double", 1.0, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
     _add_attr(SIZE_CTRL, "autoIncrementSeed", "bool", 1)
@@ -1090,7 +1100,7 @@ def _set_radial_density_falloff(value):
     if cmds.objExists(SIZE_CTRL + ".radialDensityFalloff"):
         cmds.setAttr(
             SIZE_CTRL + ".radialDensityFalloff",
-            max(0.0, min(float(value), 8.0)),
+            max(0.0, float(value)),
         )
 
 
@@ -1162,6 +1172,7 @@ def _show_control_window():
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
+    density_slider_max = max(8.0, radial_density_falloff * 2.0)
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
     auto_increment_seed = bool(
         cmds.getAttr(SIZE_CTRL + ".autoIncrementSeed")
@@ -1242,9 +1253,9 @@ def _show_control_window():
         label="Radial Density Falloff",
         field=True,
         minValue=0.0,
-        maxValue=8.0,
+        maxValue=density_slider_max,
         fieldMinValue=0.0,
-        fieldMaxValue=8.0,
+        fieldMaxValue=1.0e12,
         value=radial_density_falloff,
         step=0.1,
         precision=2,

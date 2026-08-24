@@ -60,7 +60,8 @@ rotation variance, and then gets a random yaw.
 
 Radial density falloff is independent of the profile curve. `0` distributes
 placement attempts uniformly across viable sites; larger values increasingly
-favor the center. The profile curve still defines the maximum supported height.
+favor the center. It has no hard maximum; the profile curve still defines the
+maximum supported height.
 
 Seed auto-increment is enabled by default. A successful rebuild uses the seed
 shown in the control window and then advances it for the next run. Disable the
