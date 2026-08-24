@@ -22,6 +22,7 @@ PROFILE_CTRL = PREFIX + "_falloff_CTRL"
 OUTPUT_GEO = PREFIX + "_GEO"
 MATERIAL = PREFIX + "_MAT"
 SHADING_GROUP = MATERIAL + "SG"
+CONTROL_WINDOW = PREFIX + "_controls_WINDOW"
 
 
 def _mesh_from_selection():
@@ -333,7 +334,7 @@ def build_sand_heap():
 
     count = int(cmds.getAttr(SIZE_CTRL + ".grainCount"))
     heap_height = float(cmds.getAttr(SIZE_CTRL + ".heapHeight"))
-    grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
+    base_grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variation = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     flattening = float(cmds.getAttr(SIZE_CTRL + ".grainFlattening"))
     falloff_power = float(cmds.getAttr(SIZE_CTRL + ".falloffPower"))
@@ -341,8 +342,14 @@ def build_sand_heap():
     rng = random.Random(seed)
 
     world_matrix = om.MMatrix(cmds.getAttr(SIZE_CTRL + ".worldMatrix[0]"))
+    controller_x_vector = om.MVector(1, 0, 0) * world_matrix
+    controller_z_vector = om.MVector(0, 0, 1) * world_matrix
+    horizontal_scale = math.sqrt(
+        max(controller_x_vector.length() * controller_z_vector.length(), 1.0e-12)
+    )
+    grain_size = base_grain_size * horizontal_scale
     controller_up = (om.MVector(0, 1, 0) * world_matrix).normalize()
-    controller_u = om.MVector(1, 0, 0) * world_matrix
+    controller_u = om.MVector(controller_x_vector)
     controller_u -= controller_up * (controller_u * controller_up)
     if controller_u.length() < 1.0e-8:
         controller_u = om.MVector(0, 0, 1) ^ controller_up
@@ -495,8 +502,84 @@ def build_sand_heap():
     return output
 
 
+def _set_grain_size(value):
+    if cmds.objExists(SIZE_CTRL + ".grainSize"):
+        cmds.setAttr(SIZE_CTRL + ".grainSize", max(float(value), 0.001))
+
+
+def _set_size_variance(value):
+    if cmds.objExists(SIZE_CTRL + ".grainSizeVariation"):
+        cmds.setAttr(
+            SIZE_CTRL + ".grainSizeVariation",
+            max(0.0, min(float(value), 0.95)),
+        )
+
+
+def _rebuild_from_controls(*_):
+    cmds.undoInfo(openChunk=True, chunkName="Rebuild Sand Heap")
+    try:
+        build_sand_heap()
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
+
+def _show_control_window():
+    if cmds.window(CONTROL_WINDOW, exists=True):
+        cmds.deleteUI(CONTROL_WINDOW, window=True)
+
+    grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
+    size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
+    slider_max = max(grain_size * 4.0, 0.1)
+
+    window = cmds.window(
+        CONTROL_WINDOW,
+        title="Sand Heap Controls",
+        sizeable=False,
+        widthHeight=(390, 170),
+    )
+    cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
+    cmds.text(
+        label="Values update the controller; press Rebuild to regenerate the grains.",
+        align="left",
+    )
+    cmds.floatSliderGrp(
+        label="Grain Size",
+        field=True,
+        minValue=0.001,
+        maxValue=slider_max,
+        fieldMinValue=0.001,
+        fieldMaxValue=10000.0,
+        value=grain_size,
+        step=max(slider_max / 500.0, 0.001),
+        precision=4,
+        dragCommand=_set_grain_size,
+        changeCommand=_set_grain_size,
+    )
+    cmds.floatSliderGrp(
+        label="Size Variance",
+        field=True,
+        minValue=0.0,
+        maxValue=0.95,
+        fieldMinValue=0.0,
+        fieldMaxValue=0.95,
+        value=size_variance,
+        step=0.01,
+        precision=3,
+        dragCommand=_set_size_variance,
+        changeCommand=_set_size_variance,
+    )
+    cmds.text(
+        label="Scaling the size controller also scales the resulting grain size.",
+        align="left",
+    )
+    cmds.button(label="Rebuild Sand Heap", height=32, command=_rebuild_from_controls)
+    cmds.showWindow(window)
+
+
 cmds.undoInfo(openChunk=True, chunkName="Build Sand Heap")
 try:
     build_sand_heap()
 finally:
     cmds.undoInfo(closeChunk=True)
+
+_show_control_window()

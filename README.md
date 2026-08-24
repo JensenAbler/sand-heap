@@ -21,8 +21,9 @@ grain remaining a disconnected mesh shell.
 3. Copy and run the complete contents of [`maya_sand_heap.py`](maya_sand_heap.py).
 4. Move, rotate, scale, or edit the CVs of `sandHeap_size_CTRL`.
 5. Edit `sandHeap_falloff_CTRL` to change the side-view profile.
-6. Adjust the custom Channel Box attributes on `sandHeap_size_CTRL`.
-7. Run the script again to rebuild the pile.
+6. Adjust Grain Size and Size Variance in the generated control window, or edit
+   the custom Channel Box attributes on `sandHeap_size_CTRL`.
+7. Press **Rebuild Sand Heap**, or run the script again, to rebuild the pile.
 
 After the first run, the target mesh is remembered through a message connection,
 so it does not need to remain selected.
@@ -40,7 +41,9 @@ so it does not need to remain selected.
 | `seed` | Random seed for repeatable results |
 
 The size controller's local `-Y` axis is the projection direction. Rotate the
-controller when working on sloped or unusually oriented surfaces.
+controller when working on sloped or unusually oriented surfaces. Scaling the
+size controller also scales the generated grains. For non-uniform X/Z scaling,
+the script uses the geometric mean of those two scale factors for grain size.
 
 ## Notes
 
