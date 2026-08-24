@@ -1087,14 +1087,16 @@ def _show_control_window():
     window = cmds.window(
         CONTROL_WINDOW,
         title="Sand Heap Controls",
-        sizeable=False,
-        widthHeight=(410, 440),
+        sizeable=True,
+        widthHeight=(420, 540),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
         label="Values update the controller; press Rebuild to regenerate the grains.",
         align="left",
     )
+    cmds.button(label="Rebuild Sand Heap", height=36, command=_rebuild_from_controls)
+    cmds.separator(style="in", height=8)
     cmds.floatSliderGrp(
         label="Grain Size",
         field=True,
@@ -1202,7 +1204,6 @@ def _show_control_window():
         label="Rotation variance is maximum tilt from the target surface normal.",
         align="left",
     )
-    cmds.button(label="Rebuild Sand Heap", height=32, command=_rebuild_from_controls)
     cmds.showWindow(window)
 
 
