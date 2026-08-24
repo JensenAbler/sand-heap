@@ -289,15 +289,16 @@ def _build_mesh(grains):
     if cmds.objExists(OUTPUT_GEO):
         cmds.delete(OUTPUT_GEO)
 
-    mesh_object = om.MFnMesh().create(vertices, counts, connections)
-    shape_path = om.MDagPath.getAPathTo(mesh_object).fullPathName()
-    parents = cmds.listRelatives(shape_path, parent=True, fullPath=True) or []
-    if not parents:
-        raise RuntimeError("Maya created the sand mesh without a transform node.")
-    output = cmds.rename(parents[0], OUTPUT_GEO)
-    shape = (cmds.listRelatives(output, shapes=True, fullPath=True) or [None])[0]
-    if shape:
-        cmds.rename(shape, OUTPUT_GEO + "Shape")
+    # Creating the transform explicitly avoids a Maya-version-dependent return
+    # value from MFnMesh.create() when no parent is supplied.
+    transform_object = om.MFnTransform().create()
+    transform_fn = om.MFnDagNode(transform_object)
+    transform_fn.setName(OUTPUT_GEO)
+    mesh_fn = om.MFnMesh()
+    mesh_fn.create(vertices, counts, connections, parent=transform_object)
+    mesh_fn.setName(OUTPUT_GEO + "Shape")
+    output = om.MFnDagNode(transform_object).fullPathName()
+
     cmds.polySoftEdge(output, angle=38, constructionHistory=False)
     _make_material()
     cmds.sets(output, edit=True, forceElement=SHADING_GROUP)
@@ -341,6 +342,13 @@ def build_sand_heap():
 
     world_matrix = om.MMatrix(cmds.getAttr(SIZE_CTRL + ".worldMatrix[0]"))
     controller_up = (om.MVector(0, 1, 0) * world_matrix).normalize()
+    controller_u = om.MVector(1, 0, 0) * world_matrix
+    controller_u -= controller_up * (controller_u * controller_up)
+    if controller_u.length() < 1.0e-8:
+        controller_u = om.MVector(0, 0, 1) ^ controller_up
+    controller_u.normalize()
+    controller_v = (controller_up ^ controller_u).normalize()
+
     mesh_fn = om.MFnMesh(_dag_path(target_shape))
     accel = mesh_fn.autoUniformGridParams()
     target_bbox = cmds.exactWorldBoundingBox(target_transform)
@@ -352,9 +360,18 @@ def build_sand_heap():
     ray_offset = diagonal + heap_height + grain_size * 10.0 + 10.0
     max_ray_distance = ray_offset * 2.5
 
+    # Conservative cell size: no two possibly overlapping grains can be more
+    # than one neighboring hash cell away from each other.
+    max_radius = grain_size * (1.0 + size_variation)
+    max_horizontal_radius = max_radius * max(1.28, 1.0 / 0.78)
+    cell_size = max(max_horizontal_radius * 2.0, 1.0e-6)
+    ico_vertices, _ = _icosahedron()
+    ico_vertical_extent = max(abs(vertex[1]) for vertex in ico_vertices)
+
     grains = []
+    spatial_hash = {}
     attempts = 0
-    max_attempts = count * 120
+    max_attempts = max(count * 150, 10000)
     while len(grains) < count and attempts < max_attempts:
         attempts += 1
         x = rng.uniform(min_x, max_x)
@@ -365,8 +382,11 @@ def build_sand_heap():
         relative_height = max(0.0, _profile_value(radius_fraction, profile))
         relative_height = relative_height ** falloff_power
         local_height = heap_height * relative_height
-        volume_height = rng.uniform(0.0, heap_height)
-        if volume_height > local_height:
+
+        # Bias deposition toward the taller part of the profile. Unlike the old
+        # volume-height test, this only chooses a footprint position; it never
+        # places a grain at an unsupported random elevation.
+        if relative_height <= 0.0 or rng.random() > min(relative_height, 1.0):
             continue
 
         plane_point = om.MPoint(x, 0.0, z) * world_matrix
@@ -396,10 +416,67 @@ def build_sand_heap():
             surface_normal *= -1.0
 
         radius = grain_size * rng.uniform(1.0 - size_variation, 1.0 + size_variation)
-        center = hit_point + surface_normal * (volume_height + radius * flattening * 0.92)
         yaw = rng.uniform(0.0, math.pi * 2.0)
         stretch = rng.uniform(0.78, 1.28)
+        vertical_radius = radius * flattening * ico_vertical_extent
+        horizontal_radius = radius * max(stretch, 1.0 / stretch)
+
+        # Hash in the controller's horizontal plane. The ray direction is
+        # controller-up, so plane_point and hit_point share these coordinates.
+        point_vector = om.MVector(plane_point.x, plane_point.y, plane_point.z)
+        horizontal_u = point_vector * controller_u
+        horizontal_v = point_vector * controller_v
+        cell = (
+            int(math.floor(horizontal_u / cell_size)),
+            int(math.floor(horizontal_v / cell_size)),
+        )
+
+        normal_up = surface_normal * controller_up
+        if normal_up < 1.0e-5:
+            continue
+        hit_vector = om.MVector(hit_point.x, hit_point.y, hit_point.z)
+        ground_elevation = hit_vector * controller_up
+        support_elevation = ground_elevation + vertical_radius * normal_up
+
+        # Raise the new grain just enough to clear every nearby grain. The
+        # highest constraint is the lowest non-overlapping supported position.
+        for cell_u in range(cell[0] - 1, cell[0] + 2):
+            for cell_v in range(cell[1] - 1, cell[1] + 2):
+                for neighbor in spatial_hash.get((cell_u, cell_v), []):
+                    delta_u = horizontal_u - neighbor["u"]
+                    delta_v = horizontal_v - neighbor["v"]
+                    distance_sq = delta_u * delta_u + delta_v * delta_v
+                    combined_horizontal = horizontal_radius + neighbor["horizontal_radius"]
+                    if distance_sq >= combined_horizontal * combined_horizontal:
+                        continue
+                    contact = math.sqrt(
+                        max(0.0, 1.0 - distance_sq / (combined_horizontal ** 2))
+                    )
+                    neighbor_support = neighbor["center_elevation"] + (
+                        vertical_radius + neighbor["vertical_radius"]
+                    ) * contact
+                    support_elevation = max(support_elevation, neighbor_support)
+
+        # The profile is a ceiling on the supported pile, including the top of
+        # the new grain. Rejected grains are not inserted into the hash.
+        supported_top = (
+            support_elevation - ground_elevation + vertical_radius * normal_up
+        )
+        if supported_top > local_height:
+            continue
+
+        normal_offset = (support_elevation - ground_elevation) / normal_up
+        center = hit_point + surface_normal * normal_offset
         grains.append((center, surface_normal, radius, flattening, yaw, stretch))
+        spatial_hash.setdefault(cell, []).append(
+            {
+                "u": horizontal_u,
+                "v": horizontal_v,
+                "center_elevation": support_elevation,
+                "vertical_radius": vertical_radius,
+                "horizontal_radius": horizontal_radius,
+            }
+        )
 
     if not grains:
         raise RuntimeError(
@@ -411,7 +488,9 @@ def build_sand_heap():
     cmds.select(SIZE_CTRL, replace=True)
     message = "Built {:,} grains on {}".format(len(grains), target_transform)
     if len(grains) < count:
-        message += " (requested {:,}; part of the footprint missed the target)".format(count)
+        message += (
+            " (requested {:,}; supported capacity or ray coverage was exhausted)"
+        ).format(count)
     om.MGlobal.displayInfo(message)
     return output
 

@@ -8,9 +8,11 @@ The generated pile is driven by two editable NURBS curves:
 - `sandHeap_size_CTRL` controls the footprint, position, scale, and orientation.
 - `sandHeap_falloff_CTRL` is a side-view graph controlling the heap profile.
 
-Grains are ray-projected onto the target mesh, follow its surface normals, and
-are combined into one polygon object for viewport performance. Each grain remains
-a disconnected mesh shell.
+Grains are ray-projected onto the target mesh and deposited bottom-up. A spatial
+hash raises each new grain to the lowest position supported by the terrain or a
+nearby grain, while the falloff profile acts as the pile's upper boundary. The
+result is combined into one polygon object for viewport performance, with each
+grain remaining a disconnected mesh shell.
 
 ## Usage
 
@@ -51,4 +53,3 @@ controller when working on sloped or unusually oriented surfaces.
 ## License
 
 MIT
-
