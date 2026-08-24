@@ -213,6 +213,8 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "useProjectionCache", "bool", 1)
     quality_upgrade = not cmds.objExists(SIZE_CTRL + ".packingTightness")
     _add_attr(SIZE_CTRL, "packingTightness", "double", 0.94, 0.80, 1.05)
+    _add_attr(SIZE_CTRL, "settlingIterations", "long", 5, 0, 20)
+    _add_attr(SIZE_CTRL, "settlingRadius", "double", 1.25, 0.0, 4.0)
     _add_attr(SIZE_CTRL, "highDetailGrains", "bool", 1)
     _add_attr(SIZE_CTRL, "softEdges", "bool", 1)
     _add_attr(SIZE_CTRL, "showProgress", "bool", 1)
@@ -591,6 +593,8 @@ def build_sand_heap():
     )
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
     packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
+    settling_iterations = int(cmds.getAttr(SIZE_CTRL + ".settlingIterations"))
+    settling_radius = float(cmds.getAttr(SIZE_CTRL + ".settlingRadius"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
     show_progress = bool(cmds.getAttr(SIZE_CTRL + ".showProgress"))
@@ -690,6 +694,7 @@ def build_sand_heap():
                     (1.0 - radius_fraction) ** radial_density_falloff,
                     1.0e-6,
                 ),
+                "uses": 0,
                 "failures": 0,
             }
 
@@ -788,12 +793,188 @@ def build_sand_heap():
         spatial_hash = {}
         projection_cache = {}
         cache_miss = object()
+        placement_stats = {"raycasts": 0, "cache_hits": 0, "settled": 0}
+
+        def project_surface(x, z):
+            """Project a controller-plane point and reuse local tangent data."""
+            plane_point = om.MPoint(x, 0.0, z) * world_matrix
+            point_vector = om.MVector(
+                plane_point.x, plane_point.y, plane_point.z
+            )
+            horizontal_u = point_vector * controller_u
+            horizontal_v = point_vector * controller_v
+            cell = (
+                int(math.floor(horizontal_u / cell_size)),
+                int(math.floor(horizontal_v / cell_size)),
+            )
+            projection_cell = (
+                int(math.floor(horizontal_u / projection_cell_size)),
+                int(math.floor(horizontal_v / projection_cell_size)),
+            )
+            cached_projection = (
+                projection_cache.get(projection_cell, cache_miss)
+                if use_projection_cache
+                else cache_miss
+            )
+            if cached_projection is cache_miss:
+                ray_source = plane_point + controller_up * ray_offset
+                placement_stats["raycasts"] += 1
+                try:
+                    hit = mesh_fn.closestIntersection(
+                        om.MFloatPoint(ray_source),
+                        om.MFloatVector(-controller_up),
+                        om.MSpace.kWorld,
+                        max_ray_distance,
+                        False,
+                        accelParams=accel,
+                    )
+                except RuntimeError:
+                    hit = None
+                if not hit:
+                    cached_projection = None
+                else:
+                    sample_point = om.MPoint(hit[0])
+                    face_id = hit[2]
+                    try:
+                        surface_normal, _ = mesh_fn.getClosestNormal(
+                            sample_point, om.MSpace.kWorld
+                        )
+                    except (RuntimeError, TypeError):
+                        surface_normal = mesh_fn.getPolygonNormal(
+                            face_id, om.MSpace.kWorld
+                        )
+                    surface_normal = om.MVector(surface_normal).normalize()
+                    if surface_normal * controller_up < 0.0:
+                        surface_normal *= -1.0
+                    cached_projection = (
+                        (sample_point.x, sample_point.y, sample_point.z),
+                        (surface_normal.x, surface_normal.y, surface_normal.z),
+                    )
+                if use_projection_cache:
+                    projection_cache[projection_cell] = cached_projection
+            else:
+                placement_stats["cache_hits"] += 1
+
+            if cached_projection is None:
+                return None
+            sample_components, normal_components = cached_projection
+            sample_point = om.MPoint(*sample_components)
+            surface_normal = om.MVector(*normal_components).normalize()
+            normal_up = surface_normal * controller_up
+            if normal_up < 1.0e-5:
+                return None
+            sample_delta = sample_point - plane_point
+            plane_parameter = (
+                om.MVector(sample_delta) * surface_normal
+            ) / normal_up
+            hit_point = plane_point + controller_up * plane_parameter
+            hit_vector = om.MVector(hit_point.x, hit_point.y, hit_point.z)
+            return {
+                "hit_point": hit_point,
+                "surface_normal": surface_normal,
+                "normal_up": normal_up,
+                "ground_elevation": hit_vector * controller_up,
+                "u": horizontal_u,
+                "v": horizontal_v,
+                "cell": cell,
+            }
+
+        def evaluate_drop(x, z, axes, radii, vertical_support, projection=None):
+            """Return the lowest collision-free support at a footprint point."""
+            radius_fraction = _footprint_fraction(x, z, footprint_lookup)
+            if radius_fraction > 1.0:
+                return None
+            relative_height = max(
+                0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
+            ) ** falloff_power
+            local_height = heap_height * relative_height
+            if local_height < minimum_vertical_radius * 2.0:
+                return None
+            projection = projection or project_surface(x, z)
+            if projection is None:
+                return None
+
+            surface_normal = projection["surface_normal"]
+            terrain_support = _ellipsoid_support_radius(
+                surface_normal, axes, radii
+            )
+            terrain_elevation = projection["ground_elevation"] + (
+                terrain_support
+                * min(packing_tightness, 1.0)
+                / projection["normal_up"]
+            )
+            constraints = [("terrain", terrain_elevation)]
+            cell = projection["cell"]
+            for cell_u in range(cell[0] - 1, cell[0] + 2):
+                for cell_v in range(cell[1] - 1, cell[1] + 2):
+                    for neighbor in spatial_hash.get((cell_u, cell_v), []):
+                        delta_u = projection["u"] - neighbor["u"]
+                        delta_v = projection["v"] - neighbor["v"]
+                        distance_sq = delta_u * delta_u + delta_v * delta_v
+                        if distance_sq < 1.0e-12:
+                            horizontal_direction = controller_u
+                        else:
+                            inverse_distance = 1.0 / math.sqrt(distance_sq)
+                            horizontal_direction = (
+                                controller_u * (delta_u * inverse_distance)
+                                + controller_v * (delta_v * inverse_distance)
+                            )
+                        combined_horizontal = _ellipsoid_support_radius(
+                            horizontal_direction, axes, radii
+                        ) + _ellipsoid_support_radius(
+                            horizontal_direction,
+                            neighbor["axes"],
+                            neighbor["radii"],
+                        )
+                        if distance_sq >= combined_horizontal * combined_horizontal:
+                            continue
+                        contact = math.sqrt(
+                            max(
+                                0.0,
+                                1.0 - distance_sq / (combined_horizontal ** 2),
+                            )
+                        )
+                        neighbor_elevation = neighbor["center_elevation"] + (
+                            vertical_support + neighbor["vertical_support"]
+                        ) * contact * packing_tightness
+                        constraints.append(("neighbor", neighbor_elevation))
+
+            support_elevation = max(value for _, value in constraints)
+            supported_top = (
+                support_elevation - projection["ground_elevation"]
+                + vertical_support
+            )
+            if supported_top > local_height:
+                return None
+            contact_tolerance = max(grain_size * 0.16, 1.0e-5)
+            terrain_contact = support_elevation - terrain_elevation <= contact_tolerance
+            neighbor_contacts = sum(
+                1
+                for kind, value in constraints
+                if kind == "neighbor"
+                and support_elevation - value <= contact_tolerance
+            )
+            center = projection["hit_point"] + controller_up * (
+                support_elevation - projection["ground_elevation"]
+            )
+            return {
+                "x": x,
+                "z": z,
+                "center": center,
+                "cell": cell,
+                "u": projection["u"],
+                "v": projection["v"],
+                "center_elevation": support_elevation,
+                "terrain_contact": terrain_contact,
+                "neighbor_contacts": neighbor_contacts,
+                "stable": terrain_contact or neighbor_contacts >= 2,
+                "surface_normal": surface_normal,
+            }
+
         attempts = 0
-        raycasts = 0
-        cache_hits = 0
         consecutive_failures = 0
         max_total_attempts = max(count * 40 + len(frontier) * 10, 10000)
-        progress.begin_phase(count, "Depositing supported grains...")
+        progress.begin_phase(count, "Dropping and settling grains...")
         progress_update_interval = max(count // 200, 1)
         last_progress_update = time.perf_counter()
 
@@ -815,9 +996,15 @@ def build_sand_heap():
             site_index = rng.randrange(len(frontier))
             if len(frontier) > 1:
                 alternate_index = rng.randrange(len(frontier))
-                first_score = frontier[site_index]["density_weight"] * rng.random()
+                first_score = (
+                    frontier[site_index]["density_weight"]
+                    * rng.random()
+                    / ((1.0 + frontier[site_index]["uses"]) ** 1.5)
+                )
                 alternate_score = (
-                    frontier[alternate_index]["density_weight"] * rng.random()
+                    frontier[alternate_index]["density_weight"]
+                    * rng.random()
+                    / ((1.0 + frontier[alternate_index]["uses"]) ** 1.5)
                 )
                 if alternate_score > first_score:
                     site_index = alternate_index
@@ -842,81 +1029,11 @@ def build_sand_heap():
                 _mark_frontier_failure(frontier, site_index, retire_after=4)
                 continue
 
-            plane_point = om.MPoint(x, 0.0, z) * world_matrix
-            point_vector = om.MVector(plane_point.x, plane_point.y, plane_point.z)
-            horizontal_u = point_vector * controller_u
-            horizontal_v = point_vector * controller_v
-            cell = (
-                int(math.floor(horizontal_u / cell_size)),
-                int(math.floor(horizontal_v / cell_size)),
-            )
-            projection_cell = (
-                int(math.floor(horizontal_u / projection_cell_size)),
-                int(math.floor(horizontal_v / projection_cell_size)),
-            )
-
-            cached_projection = (
-                projection_cache.get(projection_cell, cache_miss)
-                if use_projection_cache
-                else cache_miss
-            )
-            if cached_projection is cache_miss:
-                ray_source = plane_point + controller_up * ray_offset
-                raycasts += 1
-                try:
-                    hit = mesh_fn.closestIntersection(
-                        om.MFloatPoint(ray_source),
-                        om.MFloatVector(-controller_up),
-                        om.MSpace.kWorld,
-                        max_ray_distance,
-                        False,
-                        accelParams=accel,
-                    )
-                except RuntimeError:
-                    hit = None
-                if not hit:
-                    cached_projection = None
-                else:
-                    hit_point = om.MPoint(hit[0])
-                    face_id = hit[2]
-                    try:
-                        surface_normal, _ = mesh_fn.getClosestNormal(
-                            hit_point, om.MSpace.kWorld
-                        )
-                    except (RuntimeError, TypeError):
-                        surface_normal = mesh_fn.getPolygonNormal(
-                            face_id, om.MSpace.kWorld
-                        )
-                    surface_normal = om.MVector(surface_normal).normalize()
-                    if surface_normal * controller_up < 0.0:
-                        surface_normal *= -1.0
-                    cached_projection = (
-                        (hit_point.x, hit_point.y, hit_point.z),
-                        (surface_normal.x, surface_normal.y, surface_normal.z),
-                    )
-                if use_projection_cache:
-                    projection_cache[projection_cell] = cached_projection
-            else:
-                cache_hits += 1
-
-            if cached_projection is None:
+            initial_projection = project_surface(x, z)
+            if initial_projection is None:
                 consecutive_failures += 1
                 _mark_frontier_failure(frontier, site_index, retire_after=3)
                 continue
-
-            sample_point_components, normal_components = cached_projection
-            sample_point = om.MPoint(*sample_point_components)
-            surface_normal = om.MVector(*normal_components).normalize()
-            normal_up = surface_normal * controller_up
-            if normal_up < 1.0e-5:
-                consecutive_failures += 1
-                _mark_frontier_failure(frontier, site_index, retire_after=3)
-                continue
-            sample_delta = sample_point - plane_point
-            plane_parameter = (om.MVector(sample_delta) * surface_normal) / normal_up
-            hit_point = plane_point + controller_up * plane_parameter
-            hit_vector = om.MVector(hit_point.x, hit_point.y, hit_point.z)
-            ground_elevation = hit_vector * controller_up
 
             radius = grain_size * rng.uniform(
                 1.0 - size_variation, 1.0 + size_variation
@@ -924,7 +1041,7 @@ def build_sand_heap():
             yaw = rng.uniform(0.0, math.pi * 2.0)
             stretch = rng.uniform(0.78, 1.28)
             grain_normal = _randomized_normal(
-                surface_normal, rotation_variance, rng
+                initial_projection["surface_normal"], rotation_variance, rng
             )
             axes = _oriented_grain_axes(grain_normal, yaw)
             radii = (
@@ -935,75 +1052,124 @@ def build_sand_heap():
             vertical_support = _ellipsoid_support_radius(
                 controller_up, axes, radii
             )
-            terrain_support = _ellipsoid_support_radius(
-                surface_normal, axes, radii
+            placement = evaluate_drop(
+                x,
+                z,
+                axes,
+                radii,
+                vertical_support,
+                projection=initial_projection,
             )
-            support_elevation = ground_elevation + (
-                terrain_support * min(packing_tightness, 1.0) / normal_up
-            )
-
-            for cell_u in range(cell[0] - 1, cell[0] + 2):
-                for cell_v in range(cell[1] - 1, cell[1] + 2):
-                    for neighbor in spatial_hash.get((cell_u, cell_v), []):
-                        delta_u = horizontal_u - neighbor["u"]
-                        delta_v = horizontal_v - neighbor["v"]
-                        distance_sq = delta_u * delta_u + delta_v * delta_v
-                        if distance_sq < 1.0e-12:
-                            horizontal_direction = controller_u
-                        else:
-                            inverse_distance = 1.0 / math.sqrt(distance_sq)
-                            horizontal_direction = (
-                                controller_u * (delta_u * inverse_distance)
-                                + controller_v * (delta_v * inverse_distance)
-                            )
-                        combined_horizontal = _ellipsoid_support_radius(
-                            horizontal_direction, axes, radii
-                        ) + _ellipsoid_support_radius(
-                            horizontal_direction,
-                            neighbor["axes"],
-                            neighbor["radii"],
-                        )
-                        if distance_sq >= combined_horizontal * combined_horizontal:
-                            continue
-                        contact = math.sqrt(
-                            max(
-                                0.0,
-                                1.0
-                                - distance_sq / (combined_horizontal ** 2),
-                            )
-                        )
-                        neighbor_support = neighbor["center_elevation"] + (
-                            vertical_support + neighbor["vertical_support"]
-                        ) * contact * packing_tightness
-                        support_elevation = max(
-                            support_elevation, neighbor_support
-                        )
-
-            supported_top = (
-                support_elevation - ground_elevation
-                + vertical_support
-            )
-            if supported_top > local_height:
+            if placement is None:
                 consecutive_failures += 1
                 _mark_frontier_failure(frontier, site_index, retire_after=5)
                 continue
 
-            center = hit_point + controller_up * (
-                support_elevation - ground_elevation
-            )
+            moved_during_settling = False
+            if settling_iterations > 0 and not placement["stable"]:
+                for settle_index in range(settling_iterations):
+                    search_distance = (
+                        grain_size
+                        * settling_radius
+                        * (0.62 ** settle_index)
+                    )
+                    if search_distance < grain_size * 0.04:
+                        break
+                    phase = rng.uniform(0.0, math.pi * 2.0)
+                    best = placement
+                    for direction_index in range(8):
+                        angle = phase + math.pi * 2.0 * direction_index / 8.0
+                        trial = evaluate_drop(
+                            placement["x"]
+                            + math.cos(angle) * search_distance / scale_x,
+                            placement["z"]
+                            + math.sin(angle) * search_distance / scale_z,
+                            axes,
+                            radii,
+                            vertical_support,
+                        )
+                        if trial is None:
+                            continue
+                        height_delta = (
+                            trial["center_elevation"]
+                            - best["center_elevation"]
+                        )
+                        better_height = height_delta < -grain_size * 0.025
+                        similar_height = abs(height_delta) <= grain_size * 0.025
+                        better_support = (
+                            trial["stable"]
+                            and not best["stable"]
+                            and height_delta <= grain_size * 0.10
+                        ) or (
+                            similar_height
+                            and trial["neighbor_contacts"]
+                            > best["neighbor_contacts"]
+                        )
+                        if better_height or better_support:
+                            best = trial
+                    if best is placement:
+                        continue
+                    placement = best
+                    moved_during_settling = True
+                    if placement["stable"]:
+                        break
+
+            # Above the terrain, a single contact is a balance point/column,
+            # not a settled grain. Require a multi-neighbor pocket after relax.
+            if settling_iterations > 0 and not placement["stable"]:
+                consecutive_failures += 1
+                # A site that is unstable now may become a valid pocket after
+                # surrounding grains arrive, so retire it conservatively.
+                _mark_frontier_failure(frontier, site_index, retire_after=30)
+                continue
+
+            if moved_during_settling:
+                placement_stats["settled"] += 1
+                # Re-align the final grain to the normal where it actually
+                # settled, then keep that refinement only if support remains
+                # valid with the updated orientation.
+                refined_normal = _randomized_normal(
+                    placement["surface_normal"], rotation_variance, rng
+                )
+                refined_axes = _oriented_grain_axes(refined_normal, yaw)
+                refined_vertical = _ellipsoid_support_radius(
+                    controller_up, refined_axes, radii
+                )
+                refined_placement = evaluate_drop(
+                    placement["x"],
+                    placement["z"],
+                    refined_axes,
+                    radii,
+                    refined_vertical,
+                )
+                if refined_placement is not None and (
+                    settling_iterations == 0 or refined_placement["stable"]
+                ):
+                    grain_normal = refined_normal
+                    axes = refined_axes
+                    vertical_support = refined_vertical
+                    placement = refined_placement
             grains.append(
-                (center, grain_normal, radius, flattening, yaw, stretch)
+                (
+                    placement["center"],
+                    grain_normal,
+                    radius,
+                    flattening,
+                    yaw,
+                    stretch,
+                )
             )
-            spatial_hash.setdefault(cell, []).append(
+            spatial_hash.setdefault(placement["cell"], []).append(
                 {
-                    "u": horizontal_u,
-                    "v": horizontal_v,
-                    "center_elevation": support_elevation,
+                    "u": placement["u"],
+                    "v": placement["v"],
+                    "center_elevation": placement["center_elevation"],
                     "vertical_support": vertical_support,
                     "axes": axes,
                     "radii": radii,
                 }
             )
+            site["uses"] += 1
             site["failures"] = 0
             consecutive_failures = 0
 
@@ -1015,8 +1181,11 @@ def build_sand_heap():
             ):
                 progress.update(
                     len(grains),
-                    "Depositing grains: {:,} of {:,} | {:,} rays | {:,} cached".format(
-                        len(grains), count, raycasts, cache_hits
+                    "Settling grains: {:,} of {:,} | {:,} moved | {:,} rays".format(
+                        len(grains),
+                        count,
+                        placement_stats["settled"],
+                        placement_stats["raycasts"],
                     ),
                 )
                 last_progress_update = now
@@ -1053,8 +1222,15 @@ def build_sand_heap():
 
         cmds.select(SIZE_CTRL, replace=True)
         message = (
-            "Built {:,} grains on {} with seed {}; {:,} raycasts and {:,} cached projections"
-        ).format(len(grains), target_transform, seed, raycasts, cache_hits)
+            "Built {:,} grains on {} with seed {}; {:,} settled, {:,} raycasts, {:,} cached projections"
+        ).format(
+            len(grains),
+            target_transform,
+            seed,
+            placement_stats["settled"],
+            placement_stats["raycasts"],
+            placement_stats["cache_hits"],
+        )
         if auto_increment_seed:
             message += "; next seed is {}".format(next_seed)
         if len(grains) < count:
@@ -1133,6 +1309,22 @@ def _set_packing_tightness(value):
         )
 
 
+def _set_settling_iterations(value):
+    if cmds.objExists(SIZE_CTRL + ".settlingIterations"):
+        cmds.setAttr(
+            SIZE_CTRL + ".settlingIterations",
+            max(0, min(int(value), 20)),
+        )
+
+
+def _set_settling_radius(value):
+    if cmds.objExists(SIZE_CTRL + ".settlingRadius"):
+        cmds.setAttr(
+            SIZE_CTRL + ".settlingRadius",
+            max(0.0, min(float(value), 4.0)),
+        )
+
+
 def _set_projection_cache(value):
     if cmds.objExists(SIZE_CTRL + ".useProjectionCache"):
         cmds.setAttr(SIZE_CTRL + ".useProjectionCache", bool(value))
@@ -1179,6 +1371,8 @@ def _show_control_window():
     )
     failure_limit = int(cmds.getAttr(SIZE_CTRL + ".maxFailedPlacements"))
     packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
+    settling_iterations = int(cmds.getAttr(SIZE_CTRL + ".settlingIterations"))
+    settling_radius = float(cmds.getAttr(SIZE_CTRL + ".settlingRadius"))
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
@@ -1189,7 +1383,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 620),
+        widthHeight=(420, 700),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1304,6 +1498,31 @@ def _show_control_window():
         precision=2,
         dragCommand=_set_packing_tightness,
         changeCommand=_set_packing_tightness,
+    )
+    cmds.intSliderGrp(
+        label="Settling Passes",
+        field=True,
+        minValue=0,
+        maxValue=20,
+        fieldMinValue=0,
+        fieldMaxValue=20,
+        value=settling_iterations,
+        step=1,
+        dragCommand=_set_settling_iterations,
+        changeCommand=_set_settling_iterations,
+    )
+    cmds.floatSliderGrp(
+        label="Lateral Settling",
+        field=True,
+        minValue=0.0,
+        maxValue=4.0,
+        fieldMinValue=0.0,
+        fieldMaxValue=4.0,
+        value=settling_radius,
+        step=0.05,
+        precision=2,
+        dragCommand=_set_settling_radius,
+        changeCommand=_set_settling_radius,
     )
     cmds.separator(style="in", height=8)
     cmds.checkBox(

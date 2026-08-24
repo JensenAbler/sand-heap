@@ -47,6 +47,8 @@ so it does not need to remain selected.
 | `maxFailedPlacements` | Consecutive failed placements before an exhausted build stops |
 | `useProjectionCache` | Reuse terrain height and normal within each grain-sized cell |
 | `packingTightness` | Contact spacing; values below 1 add slight visual overlap |
+| `settlingIterations` | Number of lateral drop-and-relax search passes |
+| `settlingRadius` | Initial lateral search distance in grain-size units |
 | `highDetailGrains` | Use 20-face grains instead of the faster 8-face grains |
 | `softEdges` | Run Maya's soft-edge operation on the combined output |
 | `showProgress` | Show interruptible progress windows for each build phase |
@@ -62,6 +64,12 @@ Radial density falloff is independent of the profile curve. `0` distributes
 placement attempts uniformly across viable sites; larger values increasingly
 favor the center. It has no hard maximum; the profile curve still defines the
 maximum supported height.
+
+Packing uses a drop-and-relax approximation. Ground grains stop on the sampled
+terrain; raised grains search laterally for a lower position and must finish in
+a pocket supported by at least two neighboring grains. Unsupported single-contact
+balance points are rejected rather than becoming vertical columns. Set Settling
+Passes to `0` for the older, faster first-support behavior.
 
 Seed auto-increment is enabled by default. A successful rebuild uses the seed
 shown in the control window and then advances it for the next run. Disable the
@@ -79,6 +87,7 @@ sharing a flat elevation.
 The standard defaults use softened 20-face grains. Disable **High-detail grains**
 and **Soften grain edges** for a faster preview. Disable terrain caching only when
 the target has features smaller than a grain that need exact per-grain projection.
+Reducing Settling Passes is the largest speed/quality tradeoff for dense heaps.
 
 Build phases use separate interruptible Maya progress windows. Escape cancels a
 rebuild before the existing `sandHeap_GEO` is replaced.
