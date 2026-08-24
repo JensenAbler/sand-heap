@@ -44,6 +44,7 @@ so it does not need to remain selected.
 | `seed` | Random seed for repeatable results |
 | `maxFailedPlacements` | Consecutive failed placements before an exhausted build stops |
 | `useProjectionCache` | Reuse terrain height and normal within each grain-sized cell |
+| `packingTightness` | Contact spacing; values below 1 add slight visual overlap |
 | `highDetailGrains` | Use 20-face grains instead of the faster 8-face grains |
 | `softEdges` | Run Maya's soft-edge operation on the combined output |
 | `showProgress` | Show interruptible progress windows for each build phase |
@@ -58,10 +59,12 @@ rotation variance, and then gets a random yaw.
 ## Performance
 
 The script converts both controller curves into constant-time lookup tables,
-generates an active set of viable deposition sites, and caches mesh raycasts per
-grain-sized terrain cell. The fast defaults use 8-face grains without the
-additional soft-edge pass. Disable terrain caching only when the target has
-features smaller than a grain that need exact per-grain ray projection.
+generates a densely packed active set of viable deposition sites, and caches mesh
+raycasts per grain-sized terrain cell. Cached hits use the sampled tangent plane,
+so nearby grains still follow local slope instead of sharing a flat elevation.
+The standard defaults use softened 20-face grains. Disable **High-detail grains**
+and **Soften grain edges** for a faster preview. Disable terrain caching only when
+the target has features smaller than a grain that need exact per-grain projection.
 
 Build phases use separate interruptible Maya progress windows. Escape cancels a
 rebuild before the existing `sandHeap_GEO` is replaced.

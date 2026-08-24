@@ -198,9 +198,16 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
     _add_attr(SIZE_CTRL, "maxFailedPlacements", "long", 3000, 100, 1000000)
     _add_attr(SIZE_CTRL, "useProjectionCache", "bool", 1)
-    _add_attr(SIZE_CTRL, "highDetailGrains", "bool", 0)
-    _add_attr(SIZE_CTRL, "softEdges", "bool", 0)
+    quality_upgrade = not cmds.objExists(SIZE_CTRL + ".packingTightness")
+    _add_attr(SIZE_CTRL, "packingTightness", "double", 0.94, 0.80, 1.05)
+    _add_attr(SIZE_CTRL, "highDetailGrains", "bool", 1)
+    _add_attr(SIZE_CTRL, "softEdges", "bool", 1)
     _add_attr(SIZE_CTRL, "showProgress", "bool", 1)
+    if quality_upgrade:
+        # Migrate heaps made with the first performance release to the more
+        # natural default while retaining the explicit fast-mode toggles.
+        cmds.setAttr(SIZE_CTRL + ".highDetailGrains", True)
+        cmds.setAttr(SIZE_CTRL + ".softEdges", True)
 
     # A normalized side-view graph, drawn at a useful size in local XY.
     # X = distance from center; Y = relative pile height.
@@ -402,6 +409,28 @@ def _randomized_normal(surface_normal, maximum_degrees, rng):
     return (normal * math.cos(tilt) + direction * math.sin(tilt)).normalize()
 
 
+def _oriented_grain_axes(normal, yaw):
+    normal = om.MVector(normal).normalize()
+    reference = om.MVector(1, 0, 0) if abs(normal.x) < 0.9 else om.MVector(0, 0, 1)
+    tangent = (reference ^ normal).normalize()
+    bitangent = (normal ^ tangent).normalize()
+    cosine, sine = math.cos(yaw), math.sin(yaw)
+    axis_x = tangent * cosine + bitangent * sine
+    axis_z = tangent * -sine + bitangent * cosine
+    return axis_x.normalize(), normal, axis_z.normalize()
+
+
+def _ellipsoid_support_radius(direction, axes, radii):
+    """Radius of an oriented ellipsoid along a world-space direction."""
+    direction = om.MVector(direction).normalize()
+    return math.sqrt(
+        sum(
+            (radius * (axis * direction)) ** 2
+            for axis, radius in zip(axes, radii)
+        )
+    )
+
+
 def _icosahedron():
     phi = (1.0 + math.sqrt(5.0)) * 0.5
     vertices = [
@@ -462,13 +491,7 @@ def _build_mesh(grains, high_detail, soften_edges, progress):
 
     for grain_index, grain in enumerate(grains, start=1):
         center, normal, radius, flattening, yaw, stretch = grain
-        normal = om.MVector(normal).normalize()
-        reference = om.MVector(1, 0, 0) if abs(normal.x) < 0.9 else om.MVector(0, 0, 1)
-        tangent = (reference ^ normal).normalize()
-        bitangent = (normal ^ tangent).normalize()
-        cosine, sine = math.cos(yaw), math.sin(yaw)
-        axis_x = tangent * cosine + bitangent * sine
-        axis_z = tangent * -sine + bitangent * cosine
+        axis_x, normal, axis_z = _oriented_grain_axes(normal, yaw)
         rx = radius * stretch
         ry = radius * flattening
         rz = radius / stretch
@@ -550,6 +573,7 @@ def build_sand_heap():
         cmds.getAttr(SIZE_CTRL + ".maxFailedPlacements")
     )
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
+    packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
     show_progress = bool(cmds.getAttr(SIZE_CTRL + ".showProgress"))
@@ -604,10 +628,17 @@ def build_sand_heap():
         max_ray_distance = ray_offset * 2.5
 
         max_radius = grain_size * (1.0 + size_variation)
-        max_horizontal_radius = max_radius * max(1.28, 1.0 / 0.78)
+        max_horizontal_radius = max_radius * max(
+            1.28, 1.0 / 0.78, flattening
+        )
         cell_size = max(max_horizontal_radius * 2.0, 1.0e-6)
+        projection_cell_size = max(grain_size * 1.25, 1.0e-6)
         base_vertices, _ = _grain_polyhedron(high_detail)
-        vertical_extent = max(abs(vertex[1]) for vertex in base_vertices)
+        axis_extents = tuple(
+            max(abs(vertex[axis]) for vertex in base_vertices)
+            for axis in range(3)
+        )
+        vertical_extent = axis_extents[1]
         minimum_vertical_radius = (
             grain_size * (1.0 - size_variation) * flattening * vertical_extent
         )
@@ -615,8 +646,9 @@ def build_sand_heap():
         # Build reusable candidate sites at roughly one maximum grain diameter
         # apart. Sites remain active while grains can still be supported below
         # their local falloff ceiling.
-        step_x = cell_size / scale_x
-        step_z = cell_size / scale_z
+        placement_spacing = max(grain_size * 1.55, 1.0e-6)
+        step_x = placement_spacing / scale_x
+        step_z = placement_spacing / scale_z
         column_count = max(1, int(math.ceil((max_x - min_x) / step_x)))
         row_count = max(1, int(math.ceil((max_z - min_z) / step_z)))
         maximum_sites = max(min(count * 2, 20000), 128)
@@ -711,8 +743,8 @@ def build_sand_heap():
                 if alternate_score > first_score:
                     site_index = alternate_index
             site = frontier[site_index]
-            x = site["x"] + rng.uniform(-0.34, 0.34) * step_x
-            z = site["z"] + rng.uniform(-0.34, 0.34) * step_z
+            x = site["x"] + rng.uniform(-0.22, 0.22) * step_x
+            z = site["z"] + rng.uniform(-0.22, 0.22) * step_z
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
             if radius_fraction > 1.0:
                 consecutive_failures += 1
@@ -735,9 +767,13 @@ def build_sand_heap():
                 int(math.floor(horizontal_u / cell_size)),
                 int(math.floor(horizontal_v / cell_size)),
             )
+            projection_cell = (
+                int(math.floor(horizontal_u / projection_cell_size)),
+                int(math.floor(horizontal_v / projection_cell_size)),
+            )
 
             cached_projection = (
-                projection_cache.get(cell, cache_miss)
+                projection_cache.get(projection_cell, cache_miss)
                 if use_projection_cache
                 else cache_miss
             )
@@ -771,15 +807,12 @@ def build_sand_heap():
                     surface_normal = om.MVector(surface_normal).normalize()
                     if surface_normal * controller_up < 0.0:
                         surface_normal *= -1.0
-                    hit_vector = om.MVector(
-                        hit_point.x, hit_point.y, hit_point.z
-                    )
                     cached_projection = (
-                        hit_vector * controller_up,
+                        (hit_point.x, hit_point.y, hit_point.z),
                         (surface_normal.x, surface_normal.y, surface_normal.z),
                     )
                 if use_projection_cache:
-                    projection_cache[cell] = cached_projection
+                    projection_cache[projection_cell] = cached_projection
             else:
                 cache_hits += 1
 
@@ -788,26 +821,43 @@ def build_sand_heap():
                 _mark_frontier_failure(frontier, site_index, retire_after=3)
                 continue
 
-            ground_elevation, normal_components = cached_projection
-            plane_elevation = point_vector * controller_up
-            hit_point = plane_point + controller_up * (
-                ground_elevation - plane_elevation
-            )
+            sample_point_components, normal_components = cached_projection
+            sample_point = om.MPoint(*sample_point_components)
             surface_normal = om.MVector(*normal_components).normalize()
             normal_up = surface_normal * controller_up
             if normal_up < 1.0e-5:
                 consecutive_failures += 1
                 _mark_frontier_failure(frontier, site_index, retire_after=3)
                 continue
+            sample_delta = sample_point - plane_point
+            plane_parameter = (om.MVector(sample_delta) * surface_normal) / normal_up
+            hit_point = plane_point + controller_up * plane_parameter
+            hit_vector = om.MVector(hit_point.x, hit_point.y, hit_point.z)
+            ground_elevation = hit_vector * controller_up
 
             radius = grain_size * rng.uniform(
                 1.0 - size_variation, 1.0 + size_variation
             )
             yaw = rng.uniform(0.0, math.pi * 2.0)
             stretch = rng.uniform(0.78, 1.28)
-            vertical_radius = radius * flattening * vertical_extent
-            horizontal_radius = radius * max(stretch, 1.0 / stretch)
-            support_elevation = ground_elevation + vertical_radius * normal_up
+            grain_normal = _randomized_normal(
+                surface_normal, rotation_variance, rng
+            )
+            axes = _oriented_grain_axes(grain_normal, yaw)
+            radii = (
+                radius * stretch * axis_extents[0],
+                radius * flattening * axis_extents[1],
+                radius / stretch * axis_extents[2],
+            )
+            vertical_support = _ellipsoid_support_radius(
+                controller_up, axes, radii
+            )
+            terrain_support = _ellipsoid_support_radius(
+                surface_normal, axes, radii
+            )
+            support_elevation = ground_elevation + (
+                terrain_support * min(packing_tightness, 1.0) / normal_up
+            )
 
             for cell_u in range(cell[0] - 1, cell[0] + 2):
                 for cell_v in range(cell[1] - 1, cell[1] + 2):
@@ -815,8 +865,20 @@ def build_sand_heap():
                         delta_u = horizontal_u - neighbor["u"]
                         delta_v = horizontal_v - neighbor["v"]
                         distance_sq = delta_u * delta_u + delta_v * delta_v
-                        combined_horizontal = (
-                            horizontal_radius + neighbor["horizontal_radius"]
+                        if distance_sq < 1.0e-12:
+                            horizontal_direction = controller_u
+                        else:
+                            inverse_distance = 1.0 / math.sqrt(distance_sq)
+                            horizontal_direction = (
+                                controller_u * (delta_u * inverse_distance)
+                                + controller_v * (delta_v * inverse_distance)
+                            )
+                        combined_horizontal = _ellipsoid_support_radius(
+                            horizontal_direction, axes, radii
+                        ) + _ellipsoid_support_radius(
+                            horizontal_direction,
+                            neighbor["axes"],
+                            neighbor["radii"],
                         )
                         if distance_sq >= combined_horizontal * combined_horizontal:
                             continue
@@ -828,25 +890,23 @@ def build_sand_heap():
                             )
                         )
                         neighbor_support = neighbor["center_elevation"] + (
-                            vertical_radius + neighbor["vertical_radius"]
-                        ) * contact
+                            vertical_support + neighbor["vertical_support"]
+                        ) * contact * packing_tightness
                         support_elevation = max(
                             support_elevation, neighbor_support
                         )
 
             supported_top = (
                 support_elevation - ground_elevation
-                + vertical_radius * normal_up
+                + vertical_support
             )
             if supported_top > local_height:
                 consecutive_failures += 1
                 _mark_frontier_failure(frontier, site_index, retire_after=5)
                 continue
 
-            normal_offset = (support_elevation - ground_elevation) / normal_up
-            center = hit_point + surface_normal * normal_offset
-            grain_normal = _randomized_normal(
-                surface_normal, rotation_variance, rng
+            center = hit_point + controller_up * (
+                support_elevation - ground_elevation
             )
             grains.append(
                 (center, grain_normal, radius, flattening, yaw, stretch)
@@ -856,8 +916,9 @@ def build_sand_heap():
                     "u": horizontal_u,
                     "v": horizontal_v,
                     "center_elevation": support_elevation,
-                    "vertical_radius": vertical_radius,
-                    "horizontal_radius": horizontal_radius,
+                    "vertical_support": vertical_support,
+                    "axes": axes,
+                    "radii": radii,
                 }
             )
             site["failures"] = 0
@@ -939,6 +1000,14 @@ def _set_failure_limit(value):
         )
 
 
+def _set_packing_tightness(value):
+    if cmds.objExists(SIZE_CTRL + ".packingTightness"):
+        cmds.setAttr(
+            SIZE_CTRL + ".packingTightness",
+            max(0.80, min(float(value), 1.05)),
+        )
+
+
 def _set_projection_cache(value):
     if cmds.objExists(SIZE_CTRL + ".useProjectionCache"):
         cmds.setAttr(SIZE_CTRL + ".useProjectionCache", bool(value))
@@ -975,6 +1044,7 @@ def _show_control_window():
     size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
     failure_limit = int(cmds.getAttr(SIZE_CTRL + ".maxFailedPlacements"))
+    packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
@@ -985,7 +1055,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=False,
-        widthHeight=(410, 350),
+        widthHeight=(410, 390),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1042,6 +1112,19 @@ def _show_control_window():
         step=100,
         dragCommand=_set_failure_limit,
         changeCommand=_set_failure_limit,
+    )
+    cmds.floatSliderGrp(
+        label="Packing",
+        field=True,
+        minValue=0.80,
+        maxValue=1.05,
+        fieldMinValue=0.80,
+        fieldMaxValue=1.05,
+        value=packing_tightness,
+        step=0.01,
+        precision=2,
+        dragCommand=_set_packing_tightness,
+        changeCommand=_set_packing_tightness,
     )
     cmds.separator(style="in", height=8)
     cmds.checkBox(
