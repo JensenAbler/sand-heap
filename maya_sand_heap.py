@@ -195,6 +195,7 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "grainSizeVariation", "double", 0.30, 0.0, 0.95)
     _add_attr(SIZE_CTRL, "grainFlattening", "double", 0.68, 0.1, 2.0)
     _add_attr(SIZE_CTRL, "rotationVariance", "double", 12.0, 0.0, 90.0)
+    _add_attr(SIZE_CTRL, "radialDensityFalloff", "double", 1.0, 0.0, 8.0)
     _add_attr(SIZE_CTRL, "falloffPower", "double", 1.0, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
     _add_attr(SIZE_CTRL, "autoIncrementSeed", "bool", 1)
@@ -569,6 +570,9 @@ def build_sand_heap():
     size_variation = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     flattening = float(cmds.getAttr(SIZE_CTRL + ".grainFlattening"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
+    radial_density_falloff = float(
+        cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
+    )
     falloff_power = float(cmds.getAttr(SIZE_CTRL + ".falloffPower"))
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
     auto_increment_seed = bool(cmds.getAttr(SIZE_CTRL + ".autoIncrementSeed"))
@@ -684,7 +688,10 @@ def build_sand_heap():
                     {
                         "x": x,
                         "z": z,
-                        "relative_height": relative_height,
+                        "density_weight": max(
+                            (1.0 - radius_fraction) ** radial_density_falloff,
+                            1.0e-6,
+                        ),
                         "failures": 0,
                     }
                 )
@@ -734,14 +741,14 @@ def build_sand_heap():
                 )
                 return None
 
-            # Two-choice weighted selection favors tall central sites without a
-            # global rejection loop or an expensive mutable weighted index.
+            # Two-choice weighted selection applies radial density falloff
+            # without a global rejection loop or mutable weighted index.
             site_index = rng.randrange(len(frontier))
             if len(frontier) > 1:
                 alternate_index = rng.randrange(len(frontier))
-                first_score = frontier[site_index]["relative_height"] * rng.random()
+                first_score = frontier[site_index]["density_weight"] * rng.random()
                 alternate_score = (
-                    frontier[alternate_index]["relative_height"] * rng.random()
+                    frontier[alternate_index]["density_weight"] * rng.random()
                 )
                 if alternate_score > first_score:
                     site_index = alternate_index
@@ -1016,6 +1023,14 @@ def _set_rotation_variance(value):
         )
 
 
+def _set_radial_density_falloff(value):
+    if cmds.objExists(SIZE_CTRL + ".radialDensityFalloff"):
+        cmds.setAttr(
+            SIZE_CTRL + ".radialDensityFalloff",
+            max(0.0, min(float(value), 8.0)),
+        )
+
+
 def _set_seed(value):
     if cmds.objExists(SIZE_CTRL + ".seed"):
         cmds.setAttr(
@@ -1081,6 +1096,9 @@ def _show_control_window():
     grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
+    radial_density_falloff = float(
+        cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
+    )
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
     auto_increment_seed = bool(
         cmds.getAttr(SIZE_CTRL + ".autoIncrementSeed")
@@ -1097,7 +1115,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 580),
+        widthHeight=(420, 620),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1156,6 +1174,19 @@ def _show_control_window():
         precision=1,
         dragCommand=_set_rotation_variance,
         changeCommand=_set_rotation_variance,
+    )
+    cmds.floatSliderGrp(
+        label="Radial Density Falloff",
+        field=True,
+        minValue=0.0,
+        maxValue=8.0,
+        fieldMinValue=0.0,
+        fieldMaxValue=8.0,
+        value=radial_density_falloff,
+        step=0.1,
+        precision=2,
+        dragCommand=_set_radial_density_falloff,
+        changeCommand=_set_radial_density_falloff,
     )
     cmds.intSliderGrp(
         SEED_SLIDER,

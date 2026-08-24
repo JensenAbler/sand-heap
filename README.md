@@ -40,6 +40,7 @@ so it does not need to remain selected.
 | `grainSizeVariation` | Random size variation |
 | `grainFlattening` | Vertical grain scale |
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
+| `radialDensityFalloff` | Bias placement density from the center toward the edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
 | `seed` | Random seed used by the next rebuild |
 | `autoIncrementSeed` | Advance the seed after each successful rebuild |
@@ -56,6 +57,10 @@ size controller also scales the generated grains. For non-uniform X/Z scaling,
 the script uses the geometric mean of those two scale factors for grain size.
 Grain orientation begins at the target normal, receives up to the configured
 rotation variance, and then gets a random yaw.
+
+Radial density falloff is independent of the profile curve. `0` distributes
+placement attempts uniformly across viable sites; larger values increasingly
+favor the center. The profile curve still defines the maximum supported height.
 
 Seed auto-increment is enabled by default. A successful rebuild uses the seed
 shown in the control window and then advances it for the next run. Disable the
