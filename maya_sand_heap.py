@@ -992,6 +992,14 @@ def _set_grain_size(value):
         cmds.setAttr(SIZE_CTRL + ".grainSize", max(float(value), 0.001))
 
 
+def _set_grain_count(value):
+    if cmds.objExists(SIZE_CTRL + ".grainCount"):
+        cmds.setAttr(
+            SIZE_CTRL + ".grainCount",
+            max(100, min(int(value), 100000)),
+        )
+
+
 def _set_size_variance(value):
     if cmds.objExists(SIZE_CTRL + ".grainSizeVariation"):
         cmds.setAttr(
@@ -1069,6 +1077,7 @@ def _show_control_window():
     if cmds.window(CONTROL_WINDOW, exists=True):
         cmds.deleteUI(CONTROL_WINDOW, window=True)
 
+    grain_count = int(cmds.getAttr(SIZE_CTRL + ".grainCount"))
     grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
@@ -1088,7 +1097,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 540),
+        widthHeight=(420, 580),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1097,6 +1106,18 @@ def _show_control_window():
     )
     cmds.button(label="Rebuild Sand Heap", height=36, command=_rebuild_from_controls)
     cmds.separator(style="in", height=8)
+    cmds.intSliderGrp(
+        label="Number of Grains",
+        field=True,
+        minValue=100,
+        maxValue=20000,
+        fieldMinValue=100,
+        fieldMaxValue=100000,
+        value=grain_count,
+        step=100,
+        dragCommand=_set_grain_count,
+        changeCommand=_set_grain_count,
+    )
     cmds.floatSliderGrp(
         label="Grain Size",
         field=True,
