@@ -378,8 +378,7 @@ def build_sand_heap():
                 om.MSpace.kWorld,
                 max_ray_distance,
                 False,
-                accel,
-                False,
+                accelParams=accel,
             )
         except RuntimeError:
             hit = None
