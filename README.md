@@ -70,9 +70,11 @@ not advance the seed.
 ## Performance
 
 The script converts both controller curves into constant-time lookup tables,
-generates a densely packed active set of viable deposition sites, and caches mesh
-raycasts per grain-sized terrain cell. Cached hits use the sampled tangent plane,
-so nearby grains still follow local slope instead of sharing a flat elevation.
+generates a Poisson-disk active set of viable deposition sites, and caches mesh
+raycasts per grain-sized terrain cell. The blue-noise site spacing avoids visible
+rows and columns while retaining fast frontier deposition. Cached hits use the
+sampled tangent plane, so nearby grains still follow local slope instead of
+sharing a flat elevation.
 The standard defaults use softened 20-face grains. Disable **High-detail grains**
 and **Soften grain edges** for a faster preview. Disable terrain caching only when
 the target has features smaller than a grain that need exact per-grain projection.

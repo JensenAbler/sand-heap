@@ -650,63 +650,122 @@ def build_sand_heap():
             grain_size * (1.0 - size_variation) * flattening * vertical_extent
         )
 
-        # Build reusable candidate sites at roughly one maximum grain diameter
-        # apart. Sites remain active while grains can still be supported below
-        # their local falloff ceiling.
-        placement_spacing = max(grain_size * 1.55, 1.0e-6)
-        step_x = placement_spacing / scale_x
-        step_z = placement_spacing / scale_z
-        column_count = max(1, int(math.ceil((max_x - min_x) / step_x)))
-        row_count = max(1, int(math.ceil((max_z - min_z) / step_z)))
+        # Build reusable Poisson-disk sites in the controller plane. This keeps
+        # the active-frontier speed without imprinting a rectangular lattice on
+        # the resulting grain positions.
+        placement_spacing = max(grain_size * 1.25, 1.0e-6)
+        poisson_cell_size = placement_spacing / math.sqrt(2.0)
         maximum_sites = max(min(count * 2, 20000), 128)
-        potential_sites = column_count * row_count
-        if potential_sites > maximum_sites:
-            spacing_multiplier = math.sqrt(
-                float(potential_sites) / float(maximum_sites)
-            )
-            step_x *= spacing_multiplier
-            step_z *= spacing_multiplier
-            column_count = max(1, int(math.ceil((max_x - min_x) / step_x)))
-            row_count = max(1, int(math.ceil((max_z - min_z) / step_z)))
-
         frontier = []
-        progress.begin_phase(row_count, "Preparing active placement sites...")
-        site_update_interval = max(row_count // 100, 1)
-        for row in range(row_count):
-            z = min_z + (row + 0.5) * step_z
-            for column in range(column_count):
-                x = min_x + (column + 0.5) * step_x
-                radius_fraction = _footprint_fraction(x, z, footprint_lookup)
-                if radius_fraction > 1.0:
+        poisson_grid = {}
+        poisson_active = []
+
+        def make_site(x, z):
+            if x < min_x or x > max_x or z < min_z or z > max_z:
+                return None
+            radius_fraction = _footprint_fraction(x, z, footprint_lookup)
+            if radius_fraction > 1.0:
+                return None
+            relative_height = max(
+                0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
+            ) ** falloff_power
+            if heap_height * relative_height < minimum_vertical_radius * 2.0:
+                return None
+            return {
+                "x": x,
+                "z": z,
+                "site_u": x * scale_x,
+                "site_v": z * scale_z,
+                "density_weight": max(
+                    (1.0 - radius_fraction) ** radial_density_falloff,
+                    1.0e-6,
+                ),
+                "failures": 0,
+            }
+
+        # Begin from a random viable point so even the Poisson seed does not
+        # create a persistent center-origin signature between rebuilds.
+        first_site = None
+        for _ in range(2000):
+            first_site = make_site(
+                rng.uniform(min_x, max_x),
+                rng.uniform(min_z, max_z),
+            )
+            if first_site is not None:
+                break
+        if first_site is not None:
+            frontier.append(first_site)
+            poisson_active.append(0)
+            first_cell = (
+                int(math.floor(first_site["site_u"] / poisson_cell_size)),
+                int(math.floor(first_site["site_v"] / poisson_cell_size)),
+            )
+            poisson_grid[first_cell] = 0
+
+        progress.begin_phase(maximum_sites, "Preparing blue-noise placement sites...")
+        site_update_interval = max(maximum_sites // 200, 1)
+        last_site_progress = 0
+        poisson_iterations = 0
+        while poisson_active and len(frontier) < maximum_sites:
+            poisson_iterations += 1
+            active_position = rng.randrange(len(poisson_active))
+            source_site = frontier[poisson_active[active_position]]
+            found_candidate = False
+            for _ in range(30):
+                angle = rng.uniform(0.0, math.pi * 2.0)
+                distance = placement_spacing * rng.uniform(1.0, 2.0)
+                site_u = source_site["site_u"] + math.cos(angle) * distance
+                site_v = source_site["site_v"] + math.sin(angle) * distance
+                candidate = make_site(site_u / scale_x, site_v / scale_z)
+                if candidate is None:
                     continue
-                relative_height = max(
-                    0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
-                ) ** falloff_power
-                if heap_height * relative_height < minimum_vertical_radius * 2.0:
-                    continue
-                frontier.append(
-                    {
-                        "x": x,
-                        "z": z,
-                        "density_weight": max(
-                            (1.0 - radius_fraction) ** radial_density_falloff,
-                            1.0e-6,
-                        ),
-                        "failures": 0,
-                    }
+                candidate_cell = (
+                    int(math.floor(site_u / poisson_cell_size)),
+                    int(math.floor(site_v / poisson_cell_size)),
                 )
-            if (row + 1) % site_update_interval == 0 or row + 1 == row_count:
+                separated = True
+                for grid_u in range(candidate_cell[0] - 2, candidate_cell[0] + 3):
+                    for grid_v in range(candidate_cell[1] - 2, candidate_cell[1] + 3):
+                        neighbor_index = poisson_grid.get((grid_u, grid_v))
+                        if neighbor_index is None:
+                            continue
+                        neighbor = frontier[neighbor_index]
+                        delta_u = site_u - neighbor["site_u"]
+                        delta_v = site_v - neighbor["site_v"]
+                        if delta_u * delta_u + delta_v * delta_v < placement_spacing ** 2:
+                            separated = False
+                            break
+                    if not separated:
+                        break
+                if not separated:
+                    continue
+                frontier.append(candidate)
+                new_index = len(frontier) - 1
+                poisson_active.append(new_index)
+                poisson_grid[candidate_cell] = new_index
+                found_candidate = True
+                break
+
+            if not found_candidate:
+                poisson_active[active_position] = poisson_active[-1]
+                poisson_active.pop()
+
+            if (
+                len(frontier) - last_site_progress >= site_update_interval
+                or len(frontier) == maximum_sites
+            ):
                 progress.update(
-                    row + 1,
-                    "Preparing placement row {:,} of {:,}".format(
-                        row + 1, row_count
+                    len(frontier),
+                    "Preparing blue-noise sites: {:,} of up to {:,}".format(
+                        len(frontier), maximum_sites
                     ),
                 )
-                if progress.cancel_requested(force=True):
-                    om.MGlobal.displayWarning(
-                        "Sand heap rebuild cancelled; existing output kept."
-                    )
-                    return None
+                last_site_progress = len(frontier)
+            if poisson_iterations % 32 == 0 and progress.cancel_requested():
+                om.MGlobal.displayWarning(
+                    "Sand heap rebuild cancelled; existing output kept."
+                )
+                return None
 
         if not frontier:
             raise RuntimeError(
@@ -753,8 +812,12 @@ def build_sand_heap():
                 if alternate_score > first_score:
                     site_index = alternate_index
             site = frontier[site_index]
-            x = site["x"] + rng.uniform(-0.22, 0.22) * step_x
-            z = site["z"] + rng.uniform(-0.22, 0.22) * step_z
+            jitter_angle = rng.uniform(0.0, math.pi * 2.0)
+            jitter_distance = (
+                placement_spacing * 0.45 * math.sqrt(rng.random())
+            )
+            x = site["x"] + math.cos(jitter_angle) * jitter_distance / scale_x
+            z = site["z"] + math.sin(jitter_angle) * jitter_distance / scale_z
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
             if radius_fraction > 1.0:
                 consecutive_failures += 1
