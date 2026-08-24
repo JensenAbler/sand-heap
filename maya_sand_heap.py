@@ -723,7 +723,7 @@ def build_sand_heap():
         # exists, keeping sampling, density, and physical capacity independent.
         placement_spacing = max(grain_size * 1.25, 1.0e-6)
         poisson_cell_size = placement_spacing / math.sqrt(2.0)
-        maximum_sites = max(min(count * 2, 20000), 128)
+        maximum_sites = max(min(count * 6, 30000), 512)
         frontier = []
         poisson_grid = {}
         density_band_count = 64
@@ -786,21 +786,13 @@ def build_sand_heap():
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
             if radius_fraction > 1.0:
                 return None
-            relative_height = max(
-                0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
-            ) ** falloff_power
-            local_height = heap_height * relative_height
-            if local_height < minimum_layer_height:
-                return None
             return {
                 "x": x,
                 "z": z,
                 "site_u": x * scale_x,
                 "site_v": z * scale_z,
                 "radius_fraction": radius_fraction,
-                "layer_capacity": max(
-                    int(math.floor(local_height / quota_layer_height)), 1
-                ),
+                "layer_capacity": 0,
                 "max_uses": 0,
                 "sector": radial_sector(x, z),
                 "uses": 0,
@@ -892,7 +884,6 @@ def build_sand_heap():
         # material. Smaller grains at a fixed count therefore make one smaller
         # pile rather than many disconnected islands across the full controller.
         density_bands = [[] for _ in range(density_band_count)]
-        band_capacities = [0] * density_band_count
         for site in frontier:
             band_index = min(
                 int(site["radius_fraction"] * density_band_count),
@@ -900,24 +891,38 @@ def build_sand_heap():
             )
             site["band"] = band_index
             density_bands[band_index].append(site)
-            band_capacities[band_index] += site["layer_capacity"]
+
+        def scaled_site_capacity(site, trial_radius):
+            """Layer capacity of a self-similarly scaled trial mound."""
+            if trial_radius <= 0.0 or site["radius_fraction"] > trial_radius:
+                return 0
+            normalized_radius = site["radius_fraction"] / trial_radius
+            relative_height = max(
+                0.0,
+                _lookup_unit_interval(falloff_lookup, normalized_radius),
+            ) ** falloff_power
+            # Width and height contract together. Heap Height is the ceiling at
+            # the controller's full footprint, not a height every smaller pile
+            # is forced to reach.
+            local_height = heap_height * trial_radius * relative_height
+            if local_height < minimum_layer_height:
+                return 0
+            return max(int(math.floor(local_height / quota_layer_height)), 1)
 
         effective_band = density_band_count - 1
-        desired_band_capacities = [0.0] * density_band_count
         desired_total = 0.0
         for extent_band in range(density_band_count):
-            extent_denominator = max(extent_band, 1)
-            trial_capacities = [0.0] * density_band_count
+            trial_radius = (extent_band + 1) / float(density_band_count)
             trial_total = 0.0
             for band_index in range(extent_band + 1):
-                normalized_radius = band_index / float(extent_denominator)
-                capacity = (
-                    band_capacities[band_index]
-                    * density_weight(normalized_radius)
-                )
-                trial_capacities[band_index] = capacity
-                trial_total += capacity
-            desired_band_capacities = trial_capacities
+                for site in density_bands[band_index]:
+                    capacity = scaled_site_capacity(site, trial_radius)
+                    if capacity <= 0:
+                        continue
+                    normalized_radius = site["radius_fraction"] / trial_radius
+                    trial_total += capacity * density_weight(
+                        normalized_radius
+                    )
             desired_total = trial_total
             effective_band = extent_band
             if desired_total >= count:
@@ -928,6 +933,30 @@ def build_sand_heap():
                 "The density controls leave no active grain capacity. Reduce "
                 "Density Strength or move Fade Start outward."
             )
+
+        effective_radius = max(
+            (effective_band + 1) / float(density_band_count),
+            1.0 / density_band_count,
+        )
+        effective_heap_height = heap_height * effective_radius
+        band_capacities = [0] * density_band_count
+        desired_band_capacities = [0.0] * density_band_count
+        desired_total = 0.0
+        for band_index in range(effective_band + 1):
+            for site in density_bands[band_index]:
+                capacity = scaled_site_capacity(site, effective_radius)
+                site["layer_capacity"] = capacity
+                if capacity <= 0:
+                    continue
+                normalized_radius = (
+                    site["radius_fraction"] / effective_radius
+                )
+                band_capacities[band_index] += capacity
+                weighted_capacity = capacity * density_weight(
+                    normalized_radius
+                )
+                desired_band_capacities[band_index] += weighted_capacity
+                desired_total += weighted_capacity
 
         density_target_count = min(count, int(math.floor(desired_total)))
         if density_target_count < 1:
@@ -983,10 +1012,6 @@ def build_sand_heap():
                 remaining_quota -= layer_count
                 layer_index += 1
 
-        effective_radius = max(
-            (effective_band + 1) / float(density_band_count),
-            1.0 / density_band_count,
-        )
         frontier = [site for site in frontier if site["max_uses"] > 0]
         for site in frontier:
             site["active_radius"] = min(
@@ -997,6 +1022,16 @@ def build_sand_heap():
                 "The annular density quotas produced no active placement sites."
             )
         rng.shuffle(frontier)
+
+        def active_profile_height(radius_fraction):
+            if radius_fraction > effective_radius:
+                return 0.0
+            normalized_radius = radius_fraction / effective_radius
+            relative_height = max(
+                0.0,
+                _lookup_unit_interval(falloff_lookup, normalized_radius),
+            ) ** falloff_power
+            return effective_heap_height * relative_height
 
         grains = []
         spatial_hash = {}
@@ -1145,12 +1180,9 @@ def build_sand_heap():
         def evaluate_drop(x, z, axes, radii, vertical_support, projection=None):
             """Return the lowest collision-free support at a footprint point."""
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
-            if radius_fraction > 1.0:
+            if radius_fraction > effective_radius:
                 return None
-            relative_height = max(
-                0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
-            ) ** falloff_power
-            local_height = heap_height * relative_height
+            local_height = active_profile_height(radius_fraction)
             if local_height < minimum_vertical_radius * 2.0:
                 return None
             projection = projection or project_surface(x, z)
@@ -1288,14 +1320,11 @@ def build_sand_heap():
             x = site["x"] + math.cos(jitter_angle) * jitter_distance / scale_x
             z = site["z"] + math.sin(jitter_angle) * jitter_distance / scale_z
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
-            if radius_fraction > 1.0:
+            if radius_fraction > effective_radius:
                 consecutive_failures += 1
                 _mark_frontier_failure(frontier, site_index, retire_after=8)
                 continue
-            relative_height = max(
-                0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
-            ) ** falloff_power
-            local_height = heap_height * relative_height
+            local_height = active_profile_height(radius_fraction)
             if local_height < minimum_vertical_radius * 2.0:
                 consecutive_failures += 1
                 _mark_frontier_failure(frontier, site_index, retire_after=4)
@@ -1571,6 +1600,9 @@ def build_sand_heap():
             )
         message += "; occupied radial extent {:.0f}%".format(
             effective_radius * 100.0
+        )
+        message += "; active height ceiling {:.3f}".format(
+            effective_heap_height
         )
         if auto_increment_seed:
             message += "; next seed is {}".format(next_seed)
