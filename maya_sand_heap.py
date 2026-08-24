@@ -32,6 +32,7 @@ OUTPUT_GEO = PREFIX + "_GEO"
 MATERIAL = PREFIX + "_MAT"
 SHADING_GROUP = MATERIAL + "SG"
 CONTROL_WINDOW = PREFIX + "_controls_WINDOW"
+SEED_SLIDER = PREFIX + "_seed_SLIDER"
 
 
 class _ProgressWindow(object):
@@ -196,6 +197,7 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "rotationVariance", "double", 12.0, 0.0, 90.0)
     _add_attr(SIZE_CTRL, "falloffPower", "double", 1.0, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
+    _add_attr(SIZE_CTRL, "autoIncrementSeed", "bool", 1)
     _add_attr(SIZE_CTRL, "maxFailedPlacements", "long", 3000, 100, 1000000)
     _add_attr(SIZE_CTRL, "useProjectionCache", "bool", 1)
     quality_upgrade = not cmds.objExists(SIZE_CTRL + ".packingTightness")
@@ -569,6 +571,7 @@ def build_sand_heap():
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
     falloff_power = float(cmds.getAttr(SIZE_CTRL + ".falloffPower"))
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
+    auto_increment_seed = bool(cmds.getAttr(SIZE_CTRL + ".autoIncrementSeed"))
     max_failed_placements = int(
         cmds.getAttr(SIZE_CTRL + ".maxFailedPlacements")
     )
@@ -957,10 +960,23 @@ def build_sand_heap():
             )
             return None
 
+        next_seed = seed
+        if auto_increment_seed:
+            next_seed = 0 if seed >= 2147483647 else seed + 1
+            cmds.setAttr(SIZE_CTRL + ".seed", next_seed)
+            try:
+                if cmds.intSliderGrp(SEED_SLIDER, exists=True):
+                    cmds.intSliderGrp(SEED_SLIDER, edit=True, value=next_seed)
+            except RuntimeError:
+                # The scene attribute is authoritative if the old UI vanished.
+                pass
+
         cmds.select(SIZE_CTRL, replace=True)
         message = (
-            "Built {:,} grains on {} using {:,} raycasts and {:,} cached projections"
-        ).format(len(grains), target_transform, raycasts, cache_hits)
+            "Built {:,} grains on {} with seed {}; {:,} raycasts and {:,} cached projections"
+        ).format(len(grains), target_transform, seed, raycasts, cache_hits)
+        if auto_increment_seed:
+            message += "; next seed is {}".format(next_seed)
         if len(grains) < count:
             message += (
                 " (requested {:,}; active supported capacity was exhausted)"
@@ -990,6 +1006,19 @@ def _set_rotation_variance(value):
             SIZE_CTRL + ".rotationVariance",
             max(0.0, min(float(value), 90.0)),
         )
+
+
+def _set_seed(value):
+    if cmds.objExists(SIZE_CTRL + ".seed"):
+        cmds.setAttr(
+            SIZE_CTRL + ".seed",
+            max(0, min(int(value), 2147483647)),
+        )
+
+
+def _set_auto_increment_seed(value):
+    if cmds.objExists(SIZE_CTRL + ".autoIncrementSeed"):
+        cmds.setAttr(SIZE_CTRL + ".autoIncrementSeed", bool(value))
 
 
 def _set_failure_limit(value):
@@ -1043,6 +1072,10 @@ def _show_control_window():
     grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
+    seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
+    auto_increment_seed = bool(
+        cmds.getAttr(SIZE_CTRL + ".autoIncrementSeed")
+    )
     failure_limit = int(cmds.getAttr(SIZE_CTRL + ".maxFailedPlacements"))
     packing_tightness = float(cmds.getAttr(SIZE_CTRL + ".packingTightness"))
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
@@ -1055,7 +1088,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=False,
-        widthHeight=(410, 390),
+        widthHeight=(410, 440),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1100,6 +1133,24 @@ def _show_control_window():
         precision=1,
         dragCommand=_set_rotation_variance,
         changeCommand=_set_rotation_variance,
+    )
+    cmds.intSliderGrp(
+        SEED_SLIDER,
+        label="Seed",
+        field=True,
+        minValue=0,
+        maxValue=1000000,
+        fieldMinValue=0,
+        fieldMaxValue=2147483647,
+        value=seed,
+        step=1,
+        dragCommand=_set_seed,
+        changeCommand=_set_seed,
+    )
+    cmds.checkBox(
+        label="Auto-increment seed after successful rebuild",
+        value=auto_increment_seed,
+        changeCommand=_set_auto_increment_seed,
     )
     cmds.intSliderGrp(
         label="Failure Limit",

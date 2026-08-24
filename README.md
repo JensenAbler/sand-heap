@@ -41,7 +41,8 @@ so it does not need to remain selected.
 | `grainFlattening` | Vertical grain scale |
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
 | `falloffPower` | Additional shaping applied to the falloff curve |
-| `seed` | Random seed for repeatable results |
+| `seed` | Random seed used by the next rebuild |
+| `autoIncrementSeed` | Advance the seed after each successful rebuild |
 | `maxFailedPlacements` | Consecutive failed placements before an exhausted build stops |
 | `useProjectionCache` | Reuse terrain height and normal within each grain-sized cell |
 | `packingTightness` | Contact spacing; values below 1 add slight visual overlap |
@@ -55,6 +56,11 @@ size controller also scales the generated grains. For non-uniform X/Z scaling,
 the script uses the geometric mean of those two scale factors for grain size.
 Grain orientation begins at the target normal, receives up to the configured
 rotation variance, and then gets a random yaw.
+
+Seed auto-increment is enabled by default. A successful rebuild uses the seed
+shown in the control window and then advances it for the next run. Disable the
+option to reproduce a particular arrangement. Cancelled or failed rebuilds do
+not advance the seed.
 
 ## Performance
 
