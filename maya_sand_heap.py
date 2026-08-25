@@ -207,8 +207,17 @@ def _ensure_controls(target_transform):
         )
     except RuntimeError:
         pass
-    # The outer halo is a separate, additive ground layer beyond the footprint.
+    # The outer halo is a separate, additive ground layer relative to the footprint.
     # An extent of zero keeps existing scenes and rebuilds exactly halo-free.
+    _add_attr(SIZE_CTRL, "outerHaloOffset", "double", 0.0, -1.0, 10.0)
+    try:
+        cmds.addAttr(
+            SIZE_CTRL + ".outerHaloOffset",
+            edit=True,
+            minValue=-1.0,
+        )
+    except RuntimeError:
+        pass
     _add_attr(SIZE_CTRL, "outerHaloExtent", "double", 0.0, 0.0, 10.0)
     _add_attr(SIZE_CTRL, "outerHaloDensity", "double", 0.20, 0.0, 1.0)
     _add_attr(SIZE_CTRL, "outerHaloFalloff", "double", 1.5, 0.05, 20.0)
@@ -827,6 +836,7 @@ def build_sand_heap():
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
+    outer_halo_offset = float(cmds.getAttr(SIZE_CTRL + ".outerHaloOffset"))
     outer_halo_extent = float(cmds.getAttr(SIZE_CTRL + ".outerHaloExtent"))
     outer_halo_density = float(cmds.getAttr(SIZE_CTRL + ".outerHaloDensity"))
     outer_halo_falloff = float(cmds.getAttr(SIZE_CTRL + ".outerHaloFalloff"))
@@ -1107,7 +1117,8 @@ def build_sand_heap():
             if outer_halo_extent <= 0.0 or outer_halo_density <= 0.0:
                 return []
 
-            outer_radius = 1.0 + outer_halo_extent
+            inner_radius = 1.0 + outer_halo_offset
+            outer_radius = inner_radius + outer_halo_extent
             local_area = abs(
                 sum(
                     footprint[index][0]
@@ -1121,7 +1132,7 @@ def build_sand_heap():
                 local_area
                 * scale_x
                 * scale_z
-                * (outer_radius * outer_radius - 1.0)
+                * (outer_radius * outer_radius - inner_radius * inner_radius)
             )
             candidate_target = min(
                 max(int(halo_world_area / (placement_spacing ** 2) * 1.15), 16),
@@ -1152,7 +1163,7 @@ def build_sand_heap():
                 x = halo_rng.uniform(halo_min_x, halo_max_x)
                 z = halo_rng.uniform(halo_min_z, halo_max_z)
                 radius_fraction = _footprint_fraction(x, z, footprint_lookup)
-                if radius_fraction <= 1.0 or radius_fraction > outer_radius:
+                if radius_fraction <= inner_radius or radius_fraction > outer_radius:
                     continue
                 site_u = x * scale_x
                 site_v = z * scale_z
@@ -1201,7 +1212,7 @@ def build_sand_heap():
             halo_sites = []
             for candidate in candidates:
                 halo_fraction = (
-                    candidate["radius_fraction"] - 1.0
+                    candidate["radius_fraction"] - inner_radius
                 ) / outer_halo_extent
                 keep_weight = outer_halo_density * (
                     max(0.0, 1.0 - halo_fraction) ** outer_halo_falloff
@@ -1385,8 +1396,9 @@ def build_sand_heap():
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
             if halo_only:
                 if (
-                    radius_fraction <= 1.0
-                    or radius_fraction > 1.0 + outer_halo_extent
+                    radius_fraction <= 1.0 + outer_halo_offset
+                    or radius_fraction
+                    > 1.0 + outer_halo_offset + outer_halo_extent
                 ):
                     return None
                 local_height = None
@@ -1572,8 +1584,9 @@ def build_sand_heap():
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
             if halo_only:
                 if (
-                    radius_fraction <= 1.0
-                    or radius_fraction > 1.0 + outer_halo_extent
+                    radius_fraction <= 1.0 + outer_halo_offset
+                    or radius_fraction
+                    > 1.0 + outer_halo_offset + outer_halo_extent
                 ):
                     consecutive_failures += 1
                     _mark_frontier_failure(frontier, site_index, retire_after=8)
@@ -1879,6 +1892,7 @@ def build_sand_heap():
                     "grainIrregularity": grain_irregularity,
                     "rotationVariance": rotation_variance,
                     "radialDensityFalloff": radial_density_falloff,
+                    "outerHaloOffset": outer_halo_offset,
                     "outerHaloExtent": outer_halo_extent,
                     "outerHaloDensity": outer_halo_density,
                     "outerHaloFalloff": outer_halo_falloff,
@@ -1953,8 +1967,9 @@ def build_sand_heap():
                 target_shell_count
             )
         if outer_halo_extent > 0.0:
-            message += "; {:,} outer-halo grains across {:.0f}% extra radius".format(
+            message += "; {:,} outer-halo grains after {:.0f}% offset across {:.0f}% width".format(
                 halo_grain_count,
+                outer_halo_offset * 100.0,
                 outer_halo_extent * 100.0,
             )
         if auto_increment_seed:
@@ -2019,6 +2034,14 @@ def _set_outer_halo_extent(value):
         cmds.setAttr(
             SIZE_CTRL + ".outerHaloExtent",
             max(0.0, min(float(value), 10.0)),
+        )
+
+
+def _set_outer_halo_offset(value):
+    if cmds.objExists(SIZE_CTRL + ".outerHaloOffset"):
+        cmds.setAttr(
+            SIZE_CTRL + ".outerHaloOffset",
+            max(-1.0, min(float(value), 10.0)),
         )
 
 
@@ -2160,6 +2183,7 @@ def _show_control_window():
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
+    outer_halo_offset = float(cmds.getAttr(SIZE_CTRL + ".outerHaloOffset"))
     outer_halo_extent = float(cmds.getAttr(SIZE_CTRL + ".outerHaloExtent"))
     outer_halo_density = float(cmds.getAttr(SIZE_CTRL + ".outerHaloDensity"))
     outer_halo_falloff = float(cmds.getAttr(SIZE_CTRL + ".outerHaloFalloff"))
@@ -2187,7 +2211,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 1020),
+        widthHeight=(420, 1065),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -2275,8 +2299,21 @@ def _show_control_window():
     )
     cmds.separator(style="in", height=8)
     cmds.text(
-        label="Outer halo (additive surface grains beyond the footprint)",
+        label="Outer halo (additive surface grains relative to the footprint)",
         align="left",
+    )
+    cmds.floatSliderGrp(
+        label="Halo Offset",
+        field=True,
+        minValue=-1.0,
+        maxValue=max(2.0, min(10.0, outer_halo_offset * 2.0)),
+        fieldMinValue=-1.0,
+        fieldMaxValue=10.0,
+        value=outer_halo_offset,
+        step=0.05,
+        precision=2,
+        dragCommand=_set_outer_halo_offset,
+        changeCommand=_set_outer_halo_offset,
     )
     cmds.floatSliderGrp(
         label="Halo Extent",

@@ -42,7 +42,8 @@ so it does not need to remain selected.
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
 | `grainIrregularity` | Per-grain random cage displacement for pebble-like variation |
 | `radialDensityFalloff` | Reduce supported grain capacity from the center toward the edge |
-| `outerHaloExtent` | Add a surface-grain annulus beyond the footprint, measured in footprint radii |
+| `outerHaloOffset` | Move the halo start inward (negative) or outward (positive) in footprint radii |
+| `outerHaloExtent` | Set the halo's radial width in footprint radii |
 | `outerHaloDensity` | Maximum blue-noise occupancy at the inner edge of the outer halo |
 | `outerHaloFalloff` | Shape how quickly halo occupancy fades toward its outer edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
@@ -95,12 +96,14 @@ maximum. Extreme values can intentionally exhaust supported capacity before the
 requested grain count is reached.
 
 The outer halo is additive and disabled when **Halo Extent** is `0`. Enabling it
-does not change the original heap or subtract from `grainCount`: the normal heap
-is completed first, then a separately seeded blue-noise annulus is scattered
-outside normalized radius `1`. Halo grains are restricted to direct terrain
-contact, cannot stack, and cannot settle back inside the footprint. **Halo
-Density** sets occupancy at the footprint edge, while **Halo Falloff** shapes its
-fade to zero across the requested extra radius.
+does not subtract from `grainCount`: the normal heap is completed first, then a
+separately seeded blue-noise annulus is scattered. **Halo Offset** moves its
+starting radius relative to the footprint edge: `0` starts at normalized radius
+`1`, positive values leave an outward gap, and negative values pull the additive
+surface layer inward over the original footprint. **Halo Extent** sets the width
+from that starting radius. Halo grains are restricted to direct terrain contact
+and cannot stack. **Halo Density** sets occupancy at the annulus's inner edge,
+while **Halo Falloff** shapes its fade to zero across the requested width.
 
 Every generated `sandHeap_GEO` stores a human-readable build sheet in its Maya
 **Notes** attribute. It records the seed actually used, all generator parameters,
