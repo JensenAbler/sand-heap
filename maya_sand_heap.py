@@ -738,19 +738,18 @@ def build_sand_heap():
                 (1.0 - radius_fraction) ** radial_density_falloff,
                 1.0e-12,
             )
-            # Preserve fractional capacity probabilistically. Integer rounding
-            # created a hard radius where sites abruptly changed from one use
-            # to zero; stochastic rounding turns that boundary into a gradual
-            # blue-noise thinning instead.
-            expected_uses = local_height / layer_height * density_weight
-            max_uses = int(math.floor(expected_uses))
-            if rng.random() < expected_uses - max_uses:
-                max_uses += 1
+            # Density is a capacity multiplier, not merely a selection bias.
+            # Once a site's allowance is consumed it leaves the frontier, so a
+            # requested fixed count cannot refill a thinned edge later.
+            max_uses = int(math.floor(local_height / layer_height * density_weight + 0.5))
+            if max_uses < 1:
+                return None
             return {
                 "x": x,
                 "z": z,
                 "site_u": x * scale_x,
                 "site_v": z * scale_z,
+                "density_weight": density_weight,
                 "max_uses": max_uses,
                 "sector": radial_sector(x, z),
                 "uses": 0,
@@ -776,56 +775,6 @@ def build_sand_heap():
                 int(math.floor(first_site["site_v"] / poisson_cell_size)),
             )
             poisson_grid[first_cell] = 0
-
-        # Seed several regions across the whole footprint. A single center seed
-        # plus an early site-count limit can grow a solid inner disk before the
-        # blue-noise frontier ever reaches the edge, which looks like a binary
-        # radius even when the density function itself is smooth.
-        global_seed_target = min(
-            maximum_sites,
-            max(12, min(64, int(math.sqrt(maximum_sites)))),
-        )
-        global_seed_attempts = 0
-        while (
-            len(frontier) < global_seed_target
-            and global_seed_attempts < global_seed_target * 200
-        ):
-            global_seed_attempts += 1
-            candidate = make_site(
-                rng.uniform(min_x, max_x),
-                rng.uniform(min_z, max_z),
-            )
-            if candidate is None:
-                continue
-            candidate_cell = (
-                int(math.floor(candidate["site_u"] / poisson_cell_size)),
-                int(math.floor(candidate["site_v"] / poisson_cell_size)),
-            )
-            separated = True
-            for grid_u in range(candidate_cell[0] - 2, candidate_cell[0] + 3):
-                for grid_v in range(
-                    candidate_cell[1] - 2, candidate_cell[1] + 3
-                ):
-                    neighbor_index = poisson_grid.get((grid_u, grid_v))
-                    if neighbor_index is None:
-                        continue
-                    neighbor = frontier[neighbor_index]
-                    delta_u = candidate["site_u"] - neighbor["site_u"]
-                    delta_v = candidate["site_v"] - neighbor["site_v"]
-                    if (
-                        delta_u * delta_u + delta_v * delta_v
-                        < placement_spacing ** 2
-                    ):
-                        separated = False
-                        break
-                if not separated:
-                    break
-            if not separated:
-                continue
-            frontier.append(candidate)
-            new_index = len(frontier) - 1
-            poisson_active.append(new_index)
-            poisson_grid[candidate_cell] = new_index
 
         progress.begin_phase(maximum_sites, "Preparing blue-noise placement sites...")
         site_update_interval = max(maximum_sites // 200, 1)
@@ -892,12 +841,10 @@ def build_sand_heap():
                 )
                 return None
 
-        frontier = [site for site in frontier if site["max_uses"] > 0]
         if not frontier:
             raise RuntimeError(
-                "The footprint/falloff/density has no active capacity for the "
-                "current grain size. Increase heap height, reduce grain size, "
-                "or reduce radial density falloff."
+                "The footprint/falloff has no room for the current grain size. "
+                "Increase heap height or reduce grain size."
             )
         rng.shuffle(frontier)
 
@@ -1173,7 +1120,8 @@ def build_sand_heap():
                     * sector_excess(proposal["sector"])
                 )
                 proposal_score = (
-                    balance_weight
+                    proposal["density_weight"]
+                    * balance_weight
                     * rng.random()
                     / ((1.0 + proposal["uses"]) ** 1.5)
                 )
