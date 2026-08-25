@@ -40,6 +40,7 @@ so it does not need to remain selected.
 | `grainSizeVariation` | Random size variation |
 | `grainFlattening` | Vertical grain scale |
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
+| `grainIrregularity` | Per-grain random cage displacement for pebble-like variation |
 | `radialDensityFalloff` | Reduce supported grain capacity from the center toward the edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
 | `seed` | Random seed used by the next rebuild |
@@ -65,6 +66,13 @@ the size controller also scales the generated grains. For non-uniform X/Z
 scaling, the script uses the geometric mean of those two scale factors for grain
 size. Grain orientation begins at the target normal, receives up to the
 configured rotation variance, and then gets a random yaw.
+
+Grain irregularity gives every grain a unique randomly displaced cage instead
+of a shared regular polyhedron. Because a regular polyhedron subdivides into a
+near-perfect sphere, this is what keeps grains looking like uneven pebbles
+rather than identical blobs when the output is smoothed or subdivided. `0`
+restores the shared regular cage. Placement contacts use each grain's actual
+displaced vertices, so irregular grains still pack without gaps.
 
 Radial density falloff is independent of the profile curve. `0` leaves every
 viable site's carrying capacity unchanged; larger values progressively reduce

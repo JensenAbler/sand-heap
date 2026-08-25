@@ -194,6 +194,7 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "grainSize", "double", 0.16, 0.001, 10000.0)
     _add_attr(SIZE_CTRL, "grainSizeVariation", "double", 0.30, 0.0, 0.95)
     _add_attr(SIZE_CTRL, "grainFlattening", "double", 0.68, 0.1, 2.0)
+    _add_attr(SIZE_CTRL, "grainIrregularity", "double", 0.35, 0.0, 0.6)
     _add_attr(SIZE_CTRL, "rotationVariance", "double", 12.0, 0.0, 90.0)
     _add_attr(SIZE_CTRL, "radialDensityFalloff", "double", 1.0, 0.0)
     # Older versions imposed an arbitrary maximum of 8. Remove it in-place so
@@ -504,6 +505,30 @@ def _grain_polyhedron(high_detail):
     return _icosahedron() if high_detail else _octahedron()
 
 
+def _irregular_grain_vertices(base_vertices, axis_extents, irregularity, rng):
+    """Radially displace a grain cage per grain, preserving its extents.
+
+    A regular polyhedron subdivides into a near-perfect sphere, so smoothing
+    turns identical grains into identical blobs. A unique randomized cage
+    keeps an uneven pebble silhouette after subdivision. Renormalizing each
+    axis to the original extents keeps the placement math exact.
+    """
+    if irregularity <= 0.0:
+        return base_vertices
+    displaced = []
+    for vertex in base_vertices:
+        factor = 1.0 + irregularity * rng.uniform(-1.0, 1.0)
+        displaced.append(tuple(component * factor for component in vertex))
+    scales = tuple(
+        extent / max(abs(vertex[axis]) for vertex in displaced)
+        for axis, extent in enumerate(axis_extents)
+    )
+    return [
+        tuple(component * scale for component, scale in zip(vertex, scales))
+        for vertex in displaced
+    ]
+
+
 def _make_material():
     if not cmds.objExists(MATERIAL):
         cmds.shadingNode("lambert", asShader=True, name=MATERIAL)
@@ -515,7 +540,7 @@ def _make_material():
 
 
 def _build_mesh(grains, high_detail, soften_edges, progress):
-    base_vertices, base_faces = _grain_polyhedron(high_detail)
+    _, base_faces = _grain_polyhedron(high_detail)
     vertices = []
     counts = []
     connections = []
@@ -523,13 +548,13 @@ def _build_mesh(grains, high_detail, soften_edges, progress):
     update_interval = max(len(grains) // 100, 1)
 
     for grain_index, grain in enumerate(grains, start=1):
-        center, normal, radius, flattening, yaw, stretch = grain
+        center, normal, radius, flattening, yaw, stretch, shape_vertices = grain
         axis_x, normal, axis_z = _oriented_grain_axes(normal, yaw)
         rx = radius * stretch
         ry = radius * flattening
         rz = radius / stretch
         offset = len(vertices)
-        for vx, vy, vz in base_vertices:
+        for vx, vy, vz in shape_vertices:
             point = center + axis_x * (vx * rx) + normal * (vy * ry) + axis_z * (vz * rz)
             vertices.append(om.MPoint(point))
         for face in base_faces:
@@ -599,6 +624,7 @@ def build_sand_heap():
     base_grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variation = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     flattening = float(cmds.getAttr(SIZE_CTRL + ".grainFlattening"))
+    grain_irregularity = float(cmds.getAttr(SIZE_CTRL + ".grainIrregularity"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
@@ -886,8 +912,8 @@ def build_sand_heap():
             "exact_rejects": 0,
         }
 
-        def grain_mesh_support_radius(direction, axes, radii):
-            """Exact support distance of the rendered grain polyhedron."""
+        def grain_mesh_support_radius(direction, axes, radii, shape_vertices):
+            """Exact support distance of one grain's rendered polyhedron."""
             direction = om.MVector(direction).normalize()
             projections = tuple(axis * direction for axis in axes)
             scales = tuple(
@@ -902,7 +928,7 @@ def build_sand_heap():
                     + vertex[1] * scales[1] * projections[1]
                     + vertex[2] * scales[2] * projections[2]
                 )
-                for vertex in base_vertices
+                for vertex in shape_vertices
             )
 
         def project_surface(x, z, force_exact=False):
@@ -1017,7 +1043,9 @@ def build_sand_heap():
                 "cell": cell,
             }
 
-        def evaluate_drop(x, z, axes, radii, vertical_support, projection=None):
+        def evaluate_drop(
+            x, z, axes, radii, vertical_support, shape_vertices, projection=None
+        ):
             """Return the lowest collision-free support at a footprint point."""
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
             if radius_fraction > 1.0:
@@ -1034,7 +1062,7 @@ def build_sand_heap():
 
             surface_normal = projection["surface_normal"]
             terrain_support = grain_mesh_support_radius(
-                surface_normal, axes, radii
+                surface_normal, axes, radii, shape_vertices
             )
             terrain_elevation = projection["ground_elevation"] + (
                 terrain_support
@@ -1199,8 +1227,11 @@ def build_sand_heap():
                 radius * flattening * axis_extents[1],
                 radius / stretch * axis_extents[2],
             )
+            shape_vertices = _irregular_grain_vertices(
+                base_vertices, axis_extents, grain_irregularity, rng
+            )
             vertical_support = grain_mesh_support_radius(
-                gravity_up, axes, radii
+                gravity_up, axes, radii, shape_vertices
             )
             placement = evaluate_drop(
                 x,
@@ -1208,6 +1239,7 @@ def build_sand_heap():
                 axes,
                 radii,
                 vertical_support,
+                shape_vertices,
                 projection=initial_projection,
             )
             if placement is None:
@@ -1241,6 +1273,7 @@ def build_sand_heap():
                             axes,
                             radii,
                             vertical_support,
+                            shape_vertices,
                         )
                         if trial is None:
                             continue
@@ -1288,7 +1321,7 @@ def build_sand_heap():
                 )
                 refined_axes = _oriented_grain_axes(refined_normal, yaw)
                 refined_vertical = grain_mesh_support_radius(
-                    gravity_up, refined_axes, radii
+                    gravity_up, refined_axes, radii, shape_vertices
                 )
                 refined_placement = evaluate_drop(
                     placement["x"],
@@ -1296,6 +1329,7 @@ def build_sand_heap():
                     refined_axes,
                     radii,
                     refined_vertical,
+                    shape_vertices,
                 )
                 if refined_placement is not None and (
                     settling_iterations == 0 or refined_placement["stable"]
@@ -1323,7 +1357,7 @@ def build_sand_heap():
             )
             exact_axes = _oriented_grain_axes(exact_normal, yaw)
             exact_vertical = grain_mesh_support_radius(
-                gravity_up, exact_axes, radii
+                gravity_up, exact_axes, radii, shape_vertices
             )
             exact_placement = evaluate_drop(
                 placement["x"],
@@ -1331,6 +1365,7 @@ def build_sand_heap():
                 exact_axes,
                 radii,
                 exact_vertical,
+                shape_vertices,
                 projection=exact_projection,
             )
             if exact_placement is None or (
@@ -1354,6 +1389,7 @@ def build_sand_heap():
                     flattening,
                     yaw,
                     stretch,
+                    shape_vertices,
                 )
             )
             spatial_hash.setdefault(placement["cell"], []).append(
@@ -1483,6 +1519,14 @@ def _set_rotation_variance(value):
         )
 
 
+def _set_grain_irregularity(value):
+    if cmds.objExists(SIZE_CTRL + ".grainIrregularity"):
+        cmds.setAttr(
+            SIZE_CTRL + ".grainIrregularity",
+            max(0.0, min(float(value), 0.6)),
+        )
+
+
 def _set_radial_density_falloff(value):
     if cmds.objExists(SIZE_CTRL + ".radialDensityFalloff"):
         cmds.setAttr(
@@ -1601,6 +1645,7 @@ def _show_control_window():
     grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
+    grain_irregularity = float(cmds.getAttr(SIZE_CTRL + ".grainIrregularity"))
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
@@ -1627,7 +1672,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 860),
+        widthHeight=(420, 900),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1686,6 +1731,19 @@ def _show_control_window():
         precision=1,
         dragCommand=_set_rotation_variance,
         changeCommand=_set_rotation_variance,
+    )
+    cmds.floatSliderGrp(
+        label="Grain Irregularity",
+        field=True,
+        minValue=0.0,
+        maxValue=0.6,
+        fieldMinValue=0.0,
+        fieldMaxValue=0.6,
+        value=grain_irregularity,
+        step=0.01,
+        precision=2,
+        dragCommand=_set_grain_irregularity,
+        changeCommand=_set_grain_irregularity,
     )
     cmds.floatSliderGrp(
         label="Radial Density Falloff",
