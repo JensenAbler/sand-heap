@@ -35,7 +35,7 @@ so it does not need to remain selected.
 | Attribute | Purpose |
 | --- | --- |
 | `grainCount` | Number of grains to generate |
-| `heapHeight` | Maximum center height when the full controller footprint is occupied |
+| `heapHeight` | Maximum height at the center |
 | `grainSize` | Average grain radius |
 | `grainSizeVariation` | Random size variation |
 | `grainFlattening` | Vertical grain scale |
@@ -79,12 +79,8 @@ a quota from its area, profile capacity, and smooth density weight. Quotas are
 allocated one physical layer at a time, giving sparse outer bands wider blue-noise
 gaps without turning them into separate stacked clusters. The controller is the
 maximum possible footprint: when the requested grain count cannot fill it, the
-occupied radial extent contracts so the result remains one central pile. Width
-and height contract together, and the profile curve is remapped across the active
-radius. A half-width pile therefore uses half the configured `heapHeight` ceiling
-and still reaches the profile's edge instead of becoming a full-height central
-tower. The old `radialDensityFalloff` attribute is migrated once and hidden for
-compatibility.
+occupied radial extent contracts so the result remains one central pile. The old
+`radialDensityFalloff` attribute is migrated once and hidden for compatibility.
 
 Packing uses a drop-and-relax approximation. Ground grains stop on the sampled
 terrain; raised grains search laterally for a lower position and must finish in
