@@ -55,7 +55,7 @@ so it does not need to remain selected.
 | `useWorldGravity` | Settle vertically in world space instead of along the controller normal |
 | `proposalBatchSize` | Number of randomized active sites compared per placement |
 | `highDetailGrains` | Use 20-face grains instead of the faster 8-face grains |
-| `subdivideGrainCage` | Subdivide the grain cage once before displacement for craggier grains |
+| `grainCageSubdivisions` | Cage subdivision levels (0-3) adding finer displacement octaves |
 | `softEdges` | Run Maya's soft-edge operation on the combined output |
 | `showProgress` | Show interruptible progress windows for each build phase |
 
@@ -75,12 +75,14 @@ rather than identical blobs when the output is smoothed or subdivided. `0`
 restores the shared regular cage. Placement contacts use each grain's actual
 displaced vertices, so irregular grains still pack without gaps.
 
-**Subdivide grain cage** midpoint-subdivides the base polyhedron once before
-the per-vertex displacement is applied, giving the displacement roughly four
-times as many vertices to work with. Grains come out craggier and hold more
-silhouette detail under further smoothing, at about four times the face count
-(80 faces per high-detail grain, 32 per low-detail grain) and a slower
-placement pass, since contact offsets max over the denser cage.
+**Cage Subdivisions** adds fractal detail octaves. The coarse cage receives
+the full irregularity amplitude; each subdivision level midpoint-subdivides
+the cage and displaces only its new vertices at half the previous amplitude,
+so grains gain coarse lumps first and progressively finer crags on top rather
+than uniform per-vertex noise. Every level multiplies the face count by four
+(a high-detail grain has 20, 80, 320, or 1280 faces at levels 0-3) and slows
+the placement pass, since contact offsets max over the denser cage. Levels 2
+and 3 are best reserved for close-up hero grains or final rebuilds.
 
 Radial density falloff is independent of the profile curve. `0` leaves every
 viable site's carrying capacity unchanged; larger values progressively reduce

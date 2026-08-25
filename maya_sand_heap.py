@@ -231,7 +231,16 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "useWorldGravity", "bool", 1)
     _add_attr(SIZE_CTRL, "proposalBatchSize", "long", 4, 1, 16)
     _add_attr(SIZE_CTRL, "highDetailGrains", "bool", 1)
-    _add_attr(SIZE_CTRL, "subdivideGrainCage", "bool", 0)
+    _add_attr(SIZE_CTRL, "grainCageSubdivisions", "long", 0, 0, 3)
+    # An earlier release exposed a single-level boolean toggle. Carry its
+    # setting into the level count, then retire the old attribute.
+    if cmds.objExists(SIZE_CTRL + ".subdivideGrainCage"):
+        if cmds.getAttr(SIZE_CTRL + ".subdivideGrainCage"):
+            cmds.setAttr(SIZE_CTRL + ".grainCageSubdivisions", 1)
+        try:
+            cmds.deleteAttr(SIZE_CTRL, attribute="subdivideGrainCage")
+        except RuntimeError:
+            pass
     _add_attr(SIZE_CTRL, "softEdges", "bool", 1)
     _add_attr(SIZE_CTRL, "showProgress", "bool", 1)
     if quality_upgrade:
@@ -529,37 +538,75 @@ def _subdivided_once(vertices, faces):
     return vertices, new_faces
 
 
-def _grain_polyhedron(high_detail, subdivide_cage=False):
+def _grain_polyhedron(high_detail, subdivisions=0):
     vertices, faces = _icosahedron() if high_detail else _octahedron()
-    if subdivide_cage:
-        # A denser cage gives the per-vertex displacement more degrees of
-        # freedom, so grains come out craggier and hold more silhouette
-        # detail under further subdivision.
+    for _ in range(max(int(subdivisions), 0)):
         vertices, faces = _subdivided_once(vertices, faces)
     return vertices, faces
 
 
-def _irregular_grain_vertices(base_vertices, axis_extents, irregularity, rng):
-    """Radially displace a grain cage per grain, preserving its extents.
+def _irregular_grain_vertices(
+    coarse_vertices, coarse_faces, subdivisions, axis_extents, irregularity, rng
+):
+    """Build one grain's cage by fractal multi-scale radial displacement.
 
-    A regular polyhedron subdivides into a near-perfect sphere, so smoothing
-    turns identical grains into identical blobs. A unique randomized cage
-    keeps an uneven pebble silhouette after subdivision. Renormalizing each
-    axis to the original extents keeps the placement math exact.
+    Independent per-vertex noise on a dense cage reads as uniform spikes, so
+    the coarse cage receives the full displacement amplitude and each
+    subdivision level displaces only its new midpoint vertices at half the
+    previous amplitude: coarse lumps first, progressively finer crags on top.
+    Midpoint radii interpolate their parents, keeping the construction
+    continuous - zero irregularity reproduces the smooth projected cage
+    exactly. Renormalizing each axis to the reference extents keeps the
+    placement math exact.
     """
-    if irregularity <= 0.0:
-        return base_vertices
-    displaced = []
-    for vertex in base_vertices:
-        factor = 1.0 + irregularity * rng.uniform(-1.0, 1.0)
-        displaced.append(tuple(component * factor for component in vertex))
+    directions = list(coarse_vertices)
+    radii = [
+        1.0 + irregularity * rng.uniform(-1.0, 1.0) for _ in coarse_vertices
+    ]
+    faces = coarse_faces
+    amplitude = irregularity
+    for _ in range(subdivisions):
+        amplitude *= 0.5
+        midpoint_cache = {}
+
+        def midpoint(a, b):
+            key = (a, b) if a < b else (b, a)
+            cached = midpoint_cache.get(key)
+            if cached is not None:
+                return cached
+            summed = tuple(
+                ca + cb for ca, cb in zip(directions[a], directions[b])
+            )
+            length = math.sqrt(
+                sum(component * component for component in summed)
+            )
+            directions.append(tuple(component / length for component in summed))
+            radii.append(
+                (radii[a] + radii[b])
+                * 0.5
+                * (1.0 + amplitude * rng.uniform(-1.0, 1.0))
+            )
+            midpoint_cache[key] = len(directions) - 1
+            return midpoint_cache[key]
+
+        new_faces = []
+        for a, b, c in faces:
+            ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
+            new_faces.extend(
+                [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+            )
+        faces = new_faces
+    points = [
+        tuple(component * radius for component in direction)
+        for direction, radius in zip(directions, radii)
+    ]
     scales = tuple(
-        extent / max(abs(vertex[axis]) for vertex in displaced)
+        extent / max(abs(point[axis]) for point in points)
         for axis, extent in enumerate(axis_extents)
     )
     return [
-        tuple(component * scale for component, scale in zip(vertex, scales))
-        for vertex in displaced
+        tuple(component * scale for component, scale in zip(point, scales))
+        for point in points
     ]
 
 
@@ -573,8 +620,8 @@ def _make_material():
         cmds.connectAttr(MATERIAL + ".outColor", SHADING_GROUP + ".surfaceShader", force=True)
 
 
-def _build_mesh(grains, high_detail, subdivide_cage, soften_edges, progress):
-    _, base_faces = _grain_polyhedron(high_detail, subdivide_cage)
+def _build_mesh(grains, high_detail, cage_subdivisions, soften_edges, progress):
+    _, base_faces = _grain_polyhedron(high_detail, cage_subdivisions)
     vertices = []
     counts = []
     connections = []
@@ -678,7 +725,7 @@ def build_sand_heap():
     use_world_gravity = bool(cmds.getAttr(SIZE_CTRL + ".useWorldGravity"))
     proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
-    subdivide_cage = bool(cmds.getAttr(SIZE_CTRL + ".subdivideGrainCage"))
+    cage_subdivisions = int(cmds.getAttr(SIZE_CTRL + ".grainCageSubdivisions"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
     show_progress = bool(cmds.getAttr(SIZE_CTRL + ".showProgress"))
     rng = random.Random(seed)
@@ -751,7 +798,8 @@ def build_sand_heap():
         projection_cell_size = max(grain_size * 1.25, 1.0e-6)
         cache_reuse_radius_sq = (grain_size * 0.45) ** 2
         minimum_support_normal = math.cos(math.radians(max_support_slope))
-        base_vertices, _ = _grain_polyhedron(high_detail, subdivide_cage)
+        base_vertices, _ = _grain_polyhedron(high_detail, cage_subdivisions)
+        coarse_vertices, coarse_faces = _grain_polyhedron(high_detail)
         axis_extents = tuple(
             max(abs(vertex[axis]) for vertex in base_vertices)
             for axis in range(3)
@@ -1262,9 +1310,17 @@ def build_sand_heap():
                 radius * flattening * axis_extents[1],
                 radius / stretch * axis_extents[2],
             )
-            shape_vertices = _irregular_grain_vertices(
-                base_vertices, axis_extents, grain_irregularity, rng
-            )
+            if grain_irregularity > 0.0:
+                shape_vertices = _irregular_grain_vertices(
+                    coarse_vertices,
+                    coarse_faces,
+                    cage_subdivisions,
+                    axis_extents,
+                    grain_irregularity,
+                    rng,
+                )
+            else:
+                shape_vertices = base_vertices
             vertical_support = grain_mesh_support_radius(
                 gravity_up, axes, radii, shape_vertices
             )
@@ -1473,7 +1529,7 @@ def build_sand_heap():
         output = _build_mesh(
             grains,
             high_detail=high_detail,
-            subdivide_cage=subdivide_cage,
+            cage_subdivisions=cage_subdivisions,
             soften_edges=soften_edges,
             progress=progress,
         )
@@ -1655,9 +1711,12 @@ def _set_high_detail(value):
         cmds.setAttr(SIZE_CTRL + ".highDetailGrains", bool(value))
 
 
-def _set_subdivide_cage(value):
-    if cmds.objExists(SIZE_CTRL + ".subdivideGrainCage"):
-        cmds.setAttr(SIZE_CTRL + ".subdivideGrainCage", bool(value))
+def _set_cage_subdivisions(value):
+    if cmds.objExists(SIZE_CTRL + ".grainCageSubdivisions"):
+        cmds.setAttr(
+            SIZE_CTRL + ".grainCageSubdivisions",
+            max(0, min(int(value), 3)),
+        )
 
 
 def _set_soft_edges(value):
@@ -1705,7 +1764,7 @@ def _show_control_window():
     proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
-    subdivide_cage = bool(cmds.getAttr(SIZE_CTRL + ".subdivideGrainCage"))
+    cage_subdivisions = int(cmds.getAttr(SIZE_CTRL + ".grainCageSubdivisions"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
     show_progress = bool(cmds.getAttr(SIZE_CTRL + ".showProgress"))
     slider_max = max(grain_size * 4.0, 0.1)
@@ -1922,10 +1981,17 @@ def _show_control_window():
         value=high_detail,
         changeCommand=_set_high_detail,
     )
-    cmds.checkBox(
-        label="Subdivide grain cage once (craggier grains, 4x faces)",
-        value=subdivide_cage,
-        changeCommand=_set_subdivide_cage,
+    cmds.intSliderGrp(
+        label="Cage Subdivisions",
+        field=True,
+        minValue=0,
+        maxValue=3,
+        fieldMinValue=0,
+        fieldMaxValue=3,
+        value=cage_subdivisions,
+        step=1,
+        dragCommand=_set_cage_subdivisions,
+        changeCommand=_set_cage_subdivisions,
     )
     cmds.checkBox(
         label="Soften grain edges",
