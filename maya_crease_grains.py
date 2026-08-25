@@ -120,11 +120,9 @@ def crease_sand_grains():
     # meaningful history, so bake the crease values into the shape.
     cmds.delete(transform, constructionHistory=True)
 
-    # Show the result: smooth preview with OpenSubdiv honors the creases.
-    cmds.setAttr(shape + ".displaySmoothMesh", 2)
     cmds.select(transform, replace=True)
     om.MGlobal.displayInfo(
-        "{}: {} (smooth preview enabled; polySmooth with the OpenSubdiv "
+        "{}: {} (press 3 to preview; polySmooth with the OpenSubdiv "
         "method or render-time subdivision keeps the creases)".format(
             transform.rsplit("|", 1)[-1], summary
         )

@@ -123,8 +123,8 @@ edges. Its default `angle` mode maps each edge's dihedral angle onto a
 semi-sharp crease weight, so strong crags stay crisp for the first
 subdivision levels while shallow facets round off - angular but slightly
 worn, like real grains. A `uniform` mode creases every edge equally instead.
-The script enables the viewport smooth preview, which honors the creases, as
-do polySmooth with the OpenSubdiv method and render-time subdivision. It runs
+The viewport smooth preview (press 3) honors the creases, as do polySmooth
+with the OpenSubdiv method and render-time subdivision. It runs
 on the first selected mesh or on `sandHeap_GEO` when nothing is selected, and
 rebuilding the heap replaces the output mesh, so re-run the crease script
 after each rebuild.
