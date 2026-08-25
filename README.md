@@ -34,7 +34,7 @@ so it does not need to remain selected.
 
 | Attribute | Purpose |
 | --- | --- |
-| `grainCount` | Number of grains to generate |
+| `grainCount` | Requested grains in the original heap; outer-halo grains are additive |
 | `heapHeight` | Maximum height at the center |
 | `grainSize` | Average grain radius |
 | `grainSizeVariation` | Random size variation |
@@ -42,6 +42,9 @@ so it does not need to remain selected.
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
 | `grainIrregularity` | Per-grain random cage displacement for pebble-like variation |
 | `radialDensityFalloff` | Reduce supported grain capacity from the center toward the edge |
+| `outerHaloExtent` | Add a surface-grain annulus beyond the footprint, measured in footprint radii |
+| `outerHaloDensity` | Maximum blue-noise occupancy at the inner edge of the outer halo |
+| `outerHaloFalloff` | Shape how quickly halo occupancy fades toward its outer edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
 | `seed` | Random seed used by the next rebuild |
 | `autoIncrementSeed` | Advance the seed after each successful rebuild |
@@ -90,6 +93,19 @@ how many grains edge sites can accept. Consumed sites leave the active frontier,
 so a fixed requested count can no longer refill a thinned edge. It has no hard
 maximum. Extreme values can intentionally exhaust supported capacity before the
 requested grain count is reached.
+
+The outer halo is additive and disabled when **Halo Extent** is `0`. Enabling it
+does not change the original heap or subtract from `grainCount`: the normal heap
+is completed first, then a separately seeded blue-noise annulus is scattered
+outside normalized radius `1`. Halo grains are restricted to direct terrain
+contact, cannot stack, and cannot settle back inside the footprint. **Halo
+Density** sets occupancy at the footprint edge, while **Halo Falloff** shapes its
+fade to zero across the requested extra radius.
+
+Every generated `sandHeap_GEO` stores a human-readable build sheet in its Maya
+**Notes** attribute. It records the seed actually used, all generator parameters,
+the target and result counts, a formatted size-controller world matrix, and
+numbered CV coordinates for both controller curves.
 
 Packing uses a drop-and-relax approximation. Ground grains stop on the sampled
 terrain; raised grains search laterally for a lower position and must finish in

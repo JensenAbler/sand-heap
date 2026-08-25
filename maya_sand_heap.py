@@ -207,6 +207,11 @@ def _ensure_controls(target_transform):
         )
     except RuntimeError:
         pass
+    # The outer halo is a separate, additive ground layer beyond the footprint.
+    # An extent of zero keeps existing scenes and rebuilds exactly halo-free.
+    _add_attr(SIZE_CTRL, "outerHaloExtent", "double", 0.0, 0.0, 10.0)
+    _add_attr(SIZE_CTRL, "outerHaloDensity", "double", 0.20, 0.0, 1.0)
+    _add_attr(SIZE_CTRL, "outerHaloFalloff", "double", 1.5, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "falloffPower", "double", 1.0, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
     _add_attr(SIZE_CTRL, "autoIncrementSeed", "bool", 1)
@@ -310,6 +315,118 @@ def _curve_points(curve_transform, samples):
         t = start + (end - start) * (float(i) / float(samples - 1))
         result.append(fn.getPointAtParam(t, om.MSpace.kObject))
     return result
+
+
+def _curve_cv_positions(curve_transform):
+    """Return object-space CVs in a serializable form for build notes."""
+    shapes = cmds.listRelatives(
+        curve_transform,
+        shapes=True,
+        noIntermediate=True,
+        fullPath=True,
+        type="nurbsCurve",
+    ) or []
+    if not shapes:
+        return []
+    fn = om.MFnNurbsCurve(_dag_path(shapes[0]))
+    return [
+        [float(point.x), float(point.y), float(point.z)]
+        for point in fn.cvPositions(om.MSpace.kObject)
+    ]
+
+
+def _set_build_notes(output, payload):
+    """Store the complete generator snapshot in Maya's Notes attribute."""
+    label_overrides = {
+        "schemaVersion": "Schema Version",
+        "targetGeometry": "Target Geometry",
+        "seedUsed": "Seed Used",
+        "sizeController": "Size Controller",
+        "sizeControllerWorldMatrix": "Size Controller World Matrix",
+        "sizeControllerCVs": "Size Controller CVs",
+        "profileController": "Profile Controller",
+        "profileControllerCVs": "Profile Controller CVs",
+    }
+
+    def readable_label(name):
+        if name in label_overrides:
+            return label_overrides[name]
+        normalized_name = name.replace("_", " ")
+        characters = []
+        for index, character in enumerate(normalized_name):
+            if (
+                index > 0
+                and character.isupper()
+                and normalized_name[index - 1].islower()
+            ):
+                characters.append(" ")
+            characters.append(character)
+        return "".join(characters).title()
+
+    def readable_value(value):
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, float):
+            return "{:.12g}".format(value)
+        return str(value)
+
+    lines = ["Sand Heap Build Parameters", "=========================="]
+    for key in ("generator", "schemaVersion", "targetGeometry", "seedUsed"):
+        lines.append(
+            "{}: {}".format(readable_label(key), readable_value(payload[key]))
+        )
+
+    lines.extend(["", "Parameters", "----------"])
+    for key, value in payload["parameters"].items():
+        lines.append(
+            "{}: {}".format(readable_label(key), readable_value(value))
+        )
+
+    controllers = payload["controllers"]
+    lines.extend(["", "Controllers", "-----------"])
+    lines.append("Size Controller: {}".format(controllers["sizeController"]))
+    lines.append("Size Controller World Matrix:")
+    matrix = controllers["sizeControllerWorldMatrix"]
+    for row_start in range(0, len(matrix), 4):
+        lines.append(
+            "  "
+            + "  ".join(
+                "{: .12g}".format(value)
+                for value in matrix[row_start : row_start + 4]
+            )
+        )
+    lines.append("Size Controller CVs:")
+    for index, point in enumerate(controllers["sizeControllerCVs"]):
+        lines.append(
+            "  {:>3}: ({})".format(
+                index,
+                ", ".join("{:.12g}".format(value) for value in point),
+            )
+        )
+    lines.append("Profile Controller: {}".format(controllers["profileController"]))
+    lines.append("Profile Controller CVs:")
+    for index, point in enumerate(controllers["profileControllerCVs"]):
+        lines.append(
+            "  {:>3}: ({})".format(
+                index,
+                ", ".join("{:.12g}".format(value) for value in point),
+            )
+        )
+
+    lines.extend(["", "Result", "------"])
+    for key, value in payload["result"].items():
+        lines.append(
+            "{}: {}".format(readable_label(key), readable_value(value))
+        )
+
+    notes_plug = output + ".notes"
+    if not cmds.objExists(notes_plug):
+        cmds.addAttr(output, longName="notes", dataType="string")
+    cmds.setAttr(
+        notes_plug,
+        "\n".join(lines),
+        type="string",
+    )
 
 
 def _point_in_polygon(x, z, polygon):
@@ -710,6 +827,9 @@ def build_sand_heap():
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
+    outer_halo_extent = float(cmds.getAttr(SIZE_CTRL + ".outerHaloExtent"))
+    outer_halo_density = float(cmds.getAttr(SIZE_CTRL + ".outerHaloDensity"))
+    outer_halo_falloff = float(cmds.getAttr(SIZE_CTRL + ".outerHaloFalloff"))
     falloff_power = float(cmds.getAttr(SIZE_CTRL + ".falloffPower"))
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
     auto_increment_seed = bool(cmds.getAttr(SIZE_CTRL + ".autoIncrementSeed"))
@@ -982,6 +1102,131 @@ def build_sand_heap():
             )
         rng.shuffle(frontier)
 
+        def build_outer_halo_sites():
+            """Return a separately seeded blue-noise annulus outside the heap."""
+            if outer_halo_extent <= 0.0 or outer_halo_density <= 0.0:
+                return []
+
+            outer_radius = 1.0 + outer_halo_extent
+            local_area = abs(
+                sum(
+                    footprint[index][0]
+                    * footprint[(index + 1) % len(footprint)][1]
+                    - footprint[(index + 1) % len(footprint)][0]
+                    * footprint[index][1]
+                    for index in range(len(footprint))
+                )
+            ) * 0.5
+            halo_world_area = (
+                local_area
+                * scale_x
+                * scale_z
+                * (outer_radius * outer_radius - 1.0)
+            )
+            candidate_target = min(
+                max(int(halo_world_area / (placement_spacing ** 2) * 1.15), 16),
+                20000,
+            )
+            attempt_limit = max(candidate_target * 50, 2000)
+            halo_rng = random.Random(seed ^ 0x5A17C9E3)
+            halo_grid = {}
+            candidates = []
+            halo_min_x = min_x * outer_radius
+            halo_max_x = max_x * outer_radius
+            halo_min_z = min_z * outer_radius
+            halo_max_z = max_z * outer_radius
+
+            progress.begin_phase(
+                candidate_target, "Preparing outer halo sites..."
+            )
+            progress_interval = max(candidate_target // 200, 1)
+            last_site_progress = 0
+            for attempt_index in range(attempt_limit):
+                if len(candidates) >= candidate_target:
+                    break
+                if (
+                    attempt_index % 256 == 0
+                    and progress.cancel_requested()
+                ):
+                    return None
+                x = halo_rng.uniform(halo_min_x, halo_max_x)
+                z = halo_rng.uniform(halo_min_z, halo_max_z)
+                radius_fraction = _footprint_fraction(x, z, footprint_lookup)
+                if radius_fraction <= 1.0 or radius_fraction > outer_radius:
+                    continue
+                site_u = x * scale_x
+                site_v = z * scale_z
+                cell = (
+                    int(math.floor(site_u / poisson_cell_size)),
+                    int(math.floor(site_v / poisson_cell_size)),
+                )
+                separated = True
+                for grid_u in range(cell[0] - 2, cell[0] + 3):
+                    for grid_v in range(cell[1] - 2, cell[1] + 3):
+                        neighbor_index = halo_grid.get((grid_u, grid_v))
+                        if neighbor_index is None:
+                            continue
+                        neighbor = candidates[neighbor_index]
+                        delta_u = site_u - neighbor["site_u"]
+                        delta_v = site_v - neighbor["site_v"]
+                        if (
+                            delta_u * delta_u + delta_v * delta_v
+                            < placement_spacing ** 2
+                        ):
+                            separated = False
+                            break
+                    if not separated:
+                        break
+                if not separated:
+                    continue
+                halo_grid[cell] = len(candidates)
+                candidates.append(
+                    {
+                        "x": x,
+                        "z": z,
+                        "site_u": site_u,
+                        "site_v": site_v,
+                        "radius_fraction": radius_fraction,
+                    }
+                )
+                if len(candidates) - last_site_progress >= progress_interval:
+                    progress.update(
+                        len(candidates),
+                        "Preparing outer halo sites: {:,} of up to {:,}".format(
+                            len(candidates), candidate_target
+                        ),
+                    )
+                    last_site_progress = len(candidates)
+
+            halo_sites = []
+            for candidate in candidates:
+                halo_fraction = (
+                    candidate["radius_fraction"] - 1.0
+                ) / outer_halo_extent
+                keep_weight = outer_halo_density * (
+                    max(0.0, 1.0 - halo_fraction) ** outer_halo_falloff
+                )
+                if halo_rng.random() > keep_weight:
+                    continue
+                halo_sites.append(
+                    {
+                        "x": candidate["x"],
+                        "z": candidate["z"],
+                        "site_u": candidate["site_u"],
+                        "site_v": candidate["site_v"],
+                        # Density is applied once, by thinning the completed
+                        # candidate set. Surviving halo sites are equal peers.
+                        "density_weight": 1.0,
+                        "max_uses": 1,
+                        "sector": radial_sector(candidate["x"], candidate["z"]),
+                        "uses": 0,
+                        "failures": 0,
+                        "halo": True,
+                    }
+                )
+            halo_rng.shuffle(halo_sites)
+            return halo_sites
+
         grains = []
         spatial_hash = {}
         projection_cache = {}
@@ -1127,18 +1372,33 @@ def build_sand_heap():
             }
 
         def evaluate_drop(
-            x, z, axes, radii, vertical_support, shape_vertices, projection=None
+            x,
+            z,
+            axes,
+            radii,
+            vertical_support,
+            shape_vertices,
+            projection=None,
+            halo_only=False,
         ):
             """Return the lowest collision-free support at a footprint point."""
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
-            if radius_fraction > 1.0:
-                return None
-            relative_height = max(
-                0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
-            ) ** falloff_power
-            local_height = heap_height * relative_height
-            if local_height < minimum_vertical_radius * 2.0:
-                return None
+            if halo_only:
+                if (
+                    radius_fraction <= 1.0
+                    or radius_fraction > 1.0 + outer_halo_extent
+                ):
+                    return None
+                local_height = None
+            else:
+                if radius_fraction > 1.0:
+                    return None
+                relative_height = max(
+                    0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
+                ) ** falloff_power
+                local_height = heap_height * relative_height
+                if local_height < minimum_vertical_radius * 2.0:
+                    return None
             projection = projection or project_surface(x, z)
             if projection is None:
                 return None
@@ -1193,10 +1453,14 @@ def build_sand_heap():
                 support_elevation - projection["ground_elevation"]
                 + vertical_support
             )
-            if supported_top > local_height:
+            if local_height is not None and supported_top > local_height:
                 return None
             contact_tolerance = max(grain_size * 0.16, 1.0e-5)
             terrain_contact = support_elevation - terrain_elevation <= contact_tolerance
+            if halo_only and not terrain_contact:
+                # The halo is deliberately only a surface dusting. It may touch
+                # interior grains, but it can never stack on them.
+                return None
             neighbor_contacts = sum(
                 1
                 for kind, value in constraints
@@ -1227,13 +1491,46 @@ def build_sand_heap():
         progress.begin_phase(count, "Dropping and settling grains...")
         progress_update_interval = max(count // 200, 1)
         last_progress_update = time.perf_counter()
+        placement_target = count
+        phase_start_count = 0
+        halo_phase = False
+        interior_grain_count = 0
+        halo_grain_count = 0
 
-        while (
-            len(grains) < count
-            and frontier
-            and consecutive_failures < max_failed_placements
-            and attempts < max_total_attempts
-        ):
+        while True:
+            phase_complete = (
+                len(grains) >= placement_target
+                or not frontier
+                or consecutive_failures >= max_failed_placements
+                or attempts >= max_total_attempts
+            )
+            if phase_complete:
+                if not halo_phase:
+                    interior_grain_count = len(grains)
+                    halo_frontier = build_outer_halo_sites()
+                    if halo_frontier is None:
+                        om.MGlobal.displayWarning(
+                            "Sand heap rebuild cancelled; existing output kept."
+                        )
+                        return None
+                    if halo_frontier:
+                        frontier = halo_frontier
+                        halo_phase = True
+                        phase_start_count = len(grains)
+                        placement_target = len(grains) + len(frontier)
+                        attempts = 0
+                        consecutive_failures = 0
+                        max_total_attempts = max(
+                            len(frontier) * 40, 10000
+                        )
+                        progress.begin_phase(
+                            len(frontier), "Scattering outer halo grains..."
+                        )
+                        progress_update_interval = max(len(frontier) // 200, 1)
+                        last_progress_update = time.perf_counter()
+                        continue
+                break
+
             attempts += 1
             if attempts % 64 == 0 and progress.cancel_requested():
                 om.MGlobal.displayWarning(
@@ -1265,6 +1562,7 @@ def build_sand_heap():
                     site_index = proposal_index
                     best_site_score = proposal_score
             site = frontier[site_index]
+            halo_only = bool(site.get("halo", False))
             jitter_angle = rng.uniform(0.0, math.pi * 2.0)
             jitter_distance = (
                 placement_spacing * 0.45 * math.sqrt(rng.random())
@@ -1272,18 +1570,27 @@ def build_sand_heap():
             x = site["x"] + math.cos(jitter_angle) * jitter_distance / scale_x
             z = site["z"] + math.sin(jitter_angle) * jitter_distance / scale_z
             radius_fraction = _footprint_fraction(x, z, footprint_lookup)
-            if radius_fraction > 1.0:
-                consecutive_failures += 1
-                _mark_frontier_failure(frontier, site_index, retire_after=8)
-                continue
-            relative_height = max(
-                0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
-            ) ** falloff_power
-            local_height = heap_height * relative_height
-            if local_height < minimum_vertical_radius * 2.0:
-                consecutive_failures += 1
-                _mark_frontier_failure(frontier, site_index, retire_after=4)
-                continue
+            if halo_only:
+                if (
+                    radius_fraction <= 1.0
+                    or radius_fraction > 1.0 + outer_halo_extent
+                ):
+                    consecutive_failures += 1
+                    _mark_frontier_failure(frontier, site_index, retire_after=8)
+                    continue
+            else:
+                if radius_fraction > 1.0:
+                    consecutive_failures += 1
+                    _mark_frontier_failure(frontier, site_index, retire_after=8)
+                    continue
+                relative_height = max(
+                    0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
+                ) ** falloff_power
+                local_height = heap_height * relative_height
+                if local_height < minimum_vertical_radius * 2.0:
+                    consecutive_failures += 1
+                    _mark_frontier_failure(frontier, site_index, retire_after=4)
+                    continue
 
             # Multi-shell targets are typical of recursive pours. Their height
             # can jump from one grain to the next inside a cache cell, so the
@@ -1332,6 +1639,7 @@ def build_sand_heap():
                 vertical_support,
                 shape_vertices,
                 projection=initial_projection,
+                halo_only=halo_only,
             )
             if placement is None:
                 consecutive_failures += 1
@@ -1365,6 +1673,7 @@ def build_sand_heap():
                             radii,
                             vertical_support,
                             shape_vertices,
+                            halo_only=halo_only,
                         )
                         if trial is None:
                             continue
@@ -1421,6 +1730,7 @@ def build_sand_heap():
                     radii,
                     refined_vertical,
                     shape_vertices,
+                    halo_only=halo_only,
                 )
                 if refined_placement is not None and (
                     settling_iterations == 0 or refined_placement["stable"]
@@ -1458,6 +1768,7 @@ def build_sand_heap():
                 exact_vertical,
                 shape_vertices,
                 projection=exact_projection,
+                halo_only=halo_only,
             )
             if exact_placement is None or (
                 settling_iterations > 0 and not exact_placement["stable"]
@@ -1483,6 +1794,8 @@ def build_sand_heap():
                     shape_vertices,
                 )
             )
+            if halo_only:
+                halo_grain_count += 1
             spatial_hash.setdefault(placement["cell"], []).append(
                 {
                     "u": placement["u"],
@@ -1503,20 +1816,31 @@ def build_sand_heap():
             consecutive_failures = 0
 
             now = time.perf_counter()
+            phase_progress = len(grains) - phase_start_count
             if (
-                len(grains) % progress_update_interval == 0
-                or len(grains) == count
+                phase_progress % progress_update_interval == 0
+                or len(grains) == placement_target
                 or now - last_progress_update >= 0.15
             ):
-                progress.update(
-                    len(grains),
-                    "Settling grains: {:,} of {:,} | {:,} moved | {:,} rays".format(
+                if halo_phase:
+                    progress.update(
+                        phase_progress,
+                        "Outer halo: {:,} of up to {:,} | {:,} rays".format(
+                            phase_progress,
+                            placement_target - phase_start_count,
+                            placement_stats["raycasts"],
+                        ),
+                    )
+                else:
+                    progress.update(
                         len(grains),
-                        count,
-                        placement_stats["settled"],
-                        placement_stats["raycasts"],
-                    ),
-                )
+                        "Settling grains: {:,} of {:,} | {:,} moved | {:,} rays".format(
+                            len(grains),
+                            count,
+                            placement_stats["settled"],
+                            placement_stats["raycasts"],
+                        ),
+                    )
                 last_progress_update = now
 
         progress.close()
@@ -1538,6 +1862,64 @@ def build_sand_heap():
                 "Sand heap rebuild cancelled; existing output kept."
             )
             return None
+
+        _set_build_notes(
+            output,
+            {
+                "generator": "Maya Sand Heap Generator",
+                "schemaVersion": 1,
+                "targetGeometry": target_transform,
+                "seedUsed": seed,
+                "parameters": {
+                    "grainCount": count,
+                    "heapHeight": heap_height,
+                    "grainSize": base_grain_size,
+                    "grainSizeVariation": size_variation,
+                    "grainFlattening": flattening,
+                    "grainIrregularity": grain_irregularity,
+                    "rotationVariance": rotation_variance,
+                    "radialDensityFalloff": radial_density_falloff,
+                    "outerHaloExtent": outer_halo_extent,
+                    "outerHaloDensity": outer_halo_density,
+                    "outerHaloFalloff": outer_halo_falloff,
+                    "falloffPower": falloff_power,
+                    "autoIncrementSeed": auto_increment_seed,
+                    "maxFailedPlacements": max_failed_placements,
+                    "useProjectionCache": use_projection_cache,
+                    "packingTightness": packing_tightness,
+                    "settlingIterations": settling_iterations,
+                    "settlingRadius": settling_radius,
+                    "maxSupportSlope": max_support_slope,
+                    "spillBalance": spill_balance,
+                    "useWorldGravity": use_world_gravity,
+                    "proposalBatchSize": proposal_batch_size,
+                    "highDetailGrains": high_detail,
+                    "grainCageSubdivisions": cage_subdivisions,
+                    "softEdges": soften_edges,
+                    "showProgress": show_progress,
+                },
+                "controllers": {
+                    "sizeController": SIZE_CTRL,
+                    "sizeControllerWorldMatrix": [
+                        float(value)
+                        for value in cmds.xform(
+                            SIZE_CTRL,
+                            query=True,
+                            worldSpace=True,
+                            matrix=True,
+                        )
+                    ],
+                    "sizeControllerCVs": _curve_cv_positions(SIZE_CTRL),
+                    "profileController": PROFILE_CTRL,
+                    "profileControllerCVs": _curve_cv_positions(PROFILE_CTRL),
+                },
+                "result": {
+                    "interiorGrainCount": interior_grain_count,
+                    "outerHaloGrainCount": halo_grain_count,
+                    "totalGrainCount": len(grains),
+                },
+            },
+        )
 
         next_seed = seed
         if auto_increment_seed:
@@ -1570,9 +1952,14 @@ def build_sand_heap():
             message += "; composite target detected ({:,} shells)".format(
                 target_shell_count
             )
+        if outer_halo_extent > 0.0:
+            message += "; {:,} outer-halo grains across {:.0f}% extra radius".format(
+                halo_grain_count,
+                outer_halo_extent * 100.0,
+            )
         if auto_increment_seed:
             message += "; next seed is {}".format(next_seed)
-        if len(grains) < count:
+        if interior_grain_count < count:
             message += (
                 " (requested {:,}; active supported capacity was exhausted)"
             ).format(count)
@@ -1624,6 +2011,30 @@ def _set_radial_density_falloff(value):
         cmds.setAttr(
             SIZE_CTRL + ".radialDensityFalloff",
             max(0.0, float(value)),
+        )
+
+
+def _set_outer_halo_extent(value):
+    if cmds.objExists(SIZE_CTRL + ".outerHaloExtent"):
+        cmds.setAttr(
+            SIZE_CTRL + ".outerHaloExtent",
+            max(0.0, min(float(value), 10.0)),
+        )
+
+
+def _set_outer_halo_density(value):
+    if cmds.objExists(SIZE_CTRL + ".outerHaloDensity"):
+        cmds.setAttr(
+            SIZE_CTRL + ".outerHaloDensity",
+            max(0.0, min(float(value), 1.0)),
+        )
+
+
+def _set_outer_halo_falloff(value):
+    if cmds.objExists(SIZE_CTRL + ".outerHaloFalloff"):
+        cmds.setAttr(
+            SIZE_CTRL + ".outerHaloFalloff",
+            max(0.05, min(float(value), 20.0)),
         )
 
 
@@ -1749,6 +2160,9 @@ def _show_control_window():
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
+    outer_halo_extent = float(cmds.getAttr(SIZE_CTRL + ".outerHaloExtent"))
+    outer_halo_density = float(cmds.getAttr(SIZE_CTRL + ".outerHaloDensity"))
+    outer_halo_falloff = float(cmds.getAttr(SIZE_CTRL + ".outerHaloFalloff"))
     density_slider_max = max(8.0, radial_density_falloff * 2.0)
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
     auto_increment_seed = bool(
@@ -1773,7 +2187,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 930),
+        widthHeight=(420, 1020),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1859,6 +2273,51 @@ def _show_control_window():
         dragCommand=_set_radial_density_falloff,
         changeCommand=_set_radial_density_falloff,
     )
+    cmds.separator(style="in", height=8)
+    cmds.text(
+        label="Outer halo (additive surface grains beyond the footprint)",
+        align="left",
+    )
+    cmds.floatSliderGrp(
+        label="Halo Extent",
+        field=True,
+        minValue=0.0,
+        maxValue=max(2.0, min(10.0, outer_halo_extent * 2.0)),
+        fieldMinValue=0.0,
+        fieldMaxValue=10.0,
+        value=outer_halo_extent,
+        step=0.05,
+        precision=2,
+        dragCommand=_set_outer_halo_extent,
+        changeCommand=_set_outer_halo_extent,
+    )
+    cmds.floatSliderGrp(
+        label="Halo Density",
+        field=True,
+        minValue=0.0,
+        maxValue=1.0,
+        fieldMinValue=0.0,
+        fieldMaxValue=1.0,
+        value=outer_halo_density,
+        step=0.01,
+        precision=2,
+        dragCommand=_set_outer_halo_density,
+        changeCommand=_set_outer_halo_density,
+    )
+    cmds.floatSliderGrp(
+        label="Halo Falloff",
+        field=True,
+        minValue=0.05,
+        maxValue=8.0,
+        fieldMinValue=0.05,
+        fieldMaxValue=20.0,
+        value=outer_halo_falloff,
+        step=0.05,
+        precision=2,
+        dragCommand=_set_outer_halo_falloff,
+        changeCommand=_set_outer_halo_falloff,
+    )
+    cmds.separator(style="in", height=8)
     cmds.intSliderGrp(
         SEED_SLIDER,
         label="Seed",
