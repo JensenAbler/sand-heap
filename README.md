@@ -40,9 +40,7 @@ so it does not need to remain selected.
 | `grainSizeVariation` | Random size variation |
 | `grainFlattening` | Vertical grain scale |
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
-| `radialDensityStrength` | Amount of thinning at the occupied pile edge (`0`–`1`) |
-| `radialDensityFadeStart` | Normalized occupied radius where thinning begins |
-| `radialDensityFadeShape` | Curvature of the smooth density transition |
+| `radialDensityFalloff` | Reduce supported grain capacity from the center toward the edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
 | `seed` | Random seed used by the next rebuild |
 | `autoIncrementSeed` | Advance the seed after each successful rebuild |
@@ -68,19 +66,16 @@ scaling, the script uses the geometric mean of those two scale factors for grain
 size. Grain orientation begins at the target normal, receives up to the
 configured rotation variance, and then gets a random yaw.
 
-Radial density is independent of the profile curve. **Density Strength** blends
-from uniform occupancy at `0` to the full configured fade at `1`. **Fade Start**
-sets the dense core radius, and **Fade Shape** adjusts the curvature between that
-core and the occupied edge. The transition uses a bounded smoothstep field rather
-than an exponent that can collapse into a binary radius.
-
-The script divides the footprint into narrow annular bands and assigns each band
-a quota from its area, profile capacity, and smooth density weight. Quotas are
-allocated one physical layer at a time, giving sparse outer bands wider blue-noise
-gaps without turning them into separate stacked clusters. The controller is the
-maximum possible footprint: when the requested grain count cannot fill it, the
-occupied radial extent contracts so the result remains one central pile. The old
-`radialDensityFalloff` attribute is migrated once and hidden for compatibility.
+Radial density falloff is independent of the profile curve. `0` leaves every
+viable site's carrying capacity unchanged; larger values progressively reduce
+how many grains edge sites can accept. Fractional capacity is stochastically
+rounded per blue-noise site, producing progressively wider gaps rather than a
+hard cutoff radius. Density-free sites remain part of site generation so the
+blue-noise frontier can still reach and sample the entire footprint; they are
+removed only before deposition. Consumed active sites leave the frontier, so a
+fixed requested count cannot refill a thinned edge. The control has no hard
+maximum. Extreme values can intentionally exhaust supported capacity before the
+requested grain count is reached.
 
 Packing uses a drop-and-relax approximation. Ground grains stop on the sampled
 terrain; raised grains search laterally for a lower position and must finish in
@@ -110,16 +105,16 @@ not advance the seed.
 The script converts both controller curves into constant-time lookup tables,
 generates a Poisson-disk active set of viable deposition sites, and caches mesh
 raycasts per grain-sized terrain cell. The blue-noise site spacing avoids visible
-rows and columns while retaining fast frontier deposition. Global dart sampling
-covers the controller uniformly without independent growth seeds that can become
-small pile islands. Cache reuse is limited to nearby samples, misses are never
-shared, and every accepted grain receives a final exact raycast before geometry
-is created. Targets with many disconnected shells—such as a base mesh combined
-with previous pours—also use exact initial hits. Cached tangent planes therefore
-remain search accelerators rather than authoritative final contacts. Terrain and
-vertical contact offsets use the rendered polyhedron's actual vertices instead
-of a larger smooth-ellipsoid approximation, reducing the small visible gaps that
-approximation could leave.
+rows and columns while retaining fast frontier deposition. Multiple global seeds
+ensure a capped site build covers the full controller instead of growing one
+solid disk outward from its center. Cache reuse is limited to nearby samples,
+misses are never shared, and every accepted grain receives a final exact raycast
+before geometry is created. Targets with many disconnected shells—such as a base
+mesh combined with previous pours—also use exact initial hits. Cached tangent
+planes therefore remain search accelerators rather than authoritative final
+contacts. Terrain and vertical contact offsets use the rendered polyhedron's
+actual vertices instead of a larger smooth-ellipsoid approximation, reducing the
+small visible gaps that approximation could leave.
 The standard defaults use softened 20-face grains. Disable **High-detail grains**
 and **Soften grain edges** for a faster preview. Disable terrain caching only when
 the target has features smaller than a grain that need exact per-grain projection.

@@ -206,31 +206,6 @@ def _ensure_controls(target_transform):
         )
     except RuntimeError:
         pass
-    density_controls_upgrade = not cmds.objExists(
-        SIZE_CTRL + ".radialDensityStrength"
-    )
-    _add_attr(SIZE_CTRL, "radialDensityStrength", "double", 0.75, 0.0, 1.0)
-    _add_attr(SIZE_CTRL, "radialDensityFadeStart", "double", 0.40, 0.0, 0.95)
-    _add_attr(SIZE_CTRL, "radialDensityFadeShape", "double", 1.0, 0.25, 4.0)
-    if density_controls_upgrade and not created_size:
-        old_falloff = max(
-            float(cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")), 0.0
-        )
-        migrated_strength = (
-            0.0 if old_falloff <= 0.0 else old_falloff / (old_falloff + 0.5)
-        )
-        cmds.setAttr(
-            SIZE_CTRL + ".radialDensityStrength",
-            min(migrated_strength, 1.0),
-        )
-    try:
-        cmds.setAttr(
-            SIZE_CTRL + ".radialDensityFalloff",
-            keyable=False,
-            channelBox=False,
-        )
-    except RuntimeError:
-        pass
     _add_attr(SIZE_CTRL, "falloffPower", "double", 1.0, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
     _add_attr(SIZE_CTRL, "autoIncrementSeed", "bool", 1)
@@ -611,14 +586,8 @@ def build_sand_heap():
     size_variation = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     flattening = float(cmds.getAttr(SIZE_CTRL + ".grainFlattening"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
-    radial_density_strength = float(
-        cmds.getAttr(SIZE_CTRL + ".radialDensityStrength")
-    )
-    radial_density_fade_start = float(
-        cmds.getAttr(SIZE_CTRL + ".radialDensityFadeStart")
-    )
-    radial_density_fade_shape = float(
-        cmds.getAttr(SIZE_CTRL + ".radialDensityFadeShape")
+    radial_density_falloff = float(
+        cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
     falloff_power = float(cmds.getAttr(SIZE_CTRL + ".falloffPower"))
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
@@ -718,24 +687,15 @@ def build_sand_heap():
             grain_size * (1.0 - size_variation) * flattening * vertical_extent
         )
 
-        # Build a globally distributed blue-noise field in the controller plane.
-        # Density and supported layer quotas are assigned only after the field
-        # exists, keeping sampling, density, and physical capacity independent.
+        # Build reusable Poisson-disk sites in the controller plane. This keeps
+        # the active-frontier speed without imprinting a rectangular lattice on
+        # the resulting grain positions.
         placement_spacing = max(grain_size * 1.25, 1.0e-6)
         poisson_cell_size = placement_spacing / math.sqrt(2.0)
         maximum_sites = max(min(count * 2, 20000), 128)
         frontier = []
         poisson_grid = {}
-        density_band_count = 64
-        minimum_layer_height = max(minimum_vertical_radius * 2.0, 1.0e-8)
-        quota_layer_height = max(
-            grain_size
-            * flattening
-            * vertical_extent
-            * 2.0
-            * min(packing_tightness, 1.0),
-            1.0e-8,
-        )
+        poisson_active = []
 
         sector_count = 12
         sector_populations = [0] * sector_count
@@ -761,25 +721,6 @@ def build_sand_heap():
                 * sector_excess(radial_sector(x, z))
             )
 
-        def density_weight(normalized_radius):
-            """Smooth bounded density from the dense core to active edge."""
-            if radial_density_strength <= 0.0:
-                return 1.0
-            if normalized_radius <= radial_density_fade_start:
-                return 1.0
-            fade_width = max(1.0 - radial_density_fade_start, 1.0e-8)
-            blend = min(
-                max(
-                    (normalized_radius - radial_density_fade_start)
-                    / fade_width,
-                    0.0,
-                ),
-                1.0,
-            )
-            smooth_blend = blend * blend * (3.0 - 2.0 * blend)
-            shaped_blend = smooth_blend ** radial_density_fade_shape
-            return max(0.0, 1.0 - radial_density_strength * shaped_blend)
-
         def make_site(x, z):
             if x < min_x or x > max_x or z < min_z or z > max_z:
                 return None
@@ -790,24 +731,72 @@ def build_sand_heap():
                 0.0, _lookup_unit_interval(falloff_lookup, radius_fraction)
             ) ** falloff_power
             local_height = heap_height * relative_height
-            if local_height < minimum_layer_height:
+            layer_height = max(minimum_vertical_radius * 2.0, 1.0e-8)
+            if local_height < layer_height:
                 return None
+            density_weight = max(
+                (1.0 - radius_fraction) ** radial_density_falloff,
+                1.0e-12,
+            )
+            # Preserve fractional capacity probabilistically. Integer rounding
+            # created a hard radius where sites abruptly changed from one use
+            # to zero; stochastic rounding turns that boundary into a gradual
+            # blue-noise thinning instead.
+            expected_uses = local_height / layer_height * density_weight
+            max_uses = int(math.floor(expected_uses))
+            if rng.random() < expected_uses - max_uses:
+                max_uses += 1
             return {
                 "x": x,
                 "z": z,
                 "site_u": x * scale_x,
                 "site_v": z * scale_z,
-                "radius_fraction": radius_fraction,
-                "layer_capacity": max(
-                    int(math.floor(local_height / quota_layer_height)), 1
-                ),
-                "max_uses": 0,
+                "max_uses": max_uses,
                 "sector": radial_sector(x, z),
                 "uses": 0,
                 "failures": 0,
             }
 
-        def add_poisson_site(candidate):
+        # A center seed guarantees that very strong radial falloff still has a
+        # viable origin from which the blue-noise frontier can grow.
+        first_site = make_site(0.0, 0.0)
+        if first_site is None:
+            for _ in range(2000):
+                first_site = make_site(
+                    rng.uniform(min_x, max_x),
+                    rng.uniform(min_z, max_z),
+                )
+                if first_site is not None:
+                    break
+        if first_site is not None:
+            frontier.append(first_site)
+            poisson_active.append(0)
+            first_cell = (
+                int(math.floor(first_site["site_u"] / poisson_cell_size)),
+                int(math.floor(first_site["site_v"] / poisson_cell_size)),
+            )
+            poisson_grid[first_cell] = 0
+
+        # Seed several regions across the whole footprint. A single center seed
+        # plus an early site-count limit can grow a solid inner disk before the
+        # blue-noise frontier ever reaches the edge, which looks like a binary
+        # radius even when the density function itself is smooth.
+        global_seed_target = min(
+            maximum_sites,
+            max(12, min(64, int(math.sqrt(maximum_sites)))),
+        )
+        global_seed_attempts = 0
+        while (
+            len(frontier) < global_seed_target
+            and global_seed_attempts < global_seed_target * 200
+        ):
+            global_seed_attempts += 1
+            candidate = make_site(
+                rng.uniform(min_x, max_x),
+                rng.uniform(min_z, max_z),
+            )
+            if candidate is None:
+                continue
             candidate_cell = (
                 int(math.floor(candidate["site_u"] / poisson_cell_size)),
                 int(math.floor(candidate["site_v"] / poisson_cell_size)),
@@ -832,37 +821,59 @@ def build_sand_heap():
                 if not separated:
                     break
             if not separated:
-                return False
+                continue
             frontier.append(candidate)
             new_index = len(frontier) - 1
+            poisson_active.append(new_index)
             poisson_grid[candidate_cell] = new_index
-            return True
-
-        center_site = make_site(0.0, 0.0)
-        if center_site is not None:
-            add_poisson_site(center_site)
 
         progress.begin_phase(maximum_sites, "Preparing blue-noise placement sites...")
         site_update_interval = max(maximum_sites // 200, 1)
         last_site_progress = 0
-        site_attempts = 0
-        consecutive_site_failures = 0
-        maximum_site_attempts = max(maximum_sites * 50, 10000)
-        site_failure_limit = max(min(maximum_sites * 2, 20000), 3000)
-        while (
-            len(frontier) < maximum_sites
-            and site_attempts < maximum_site_attempts
-            and consecutive_site_failures < site_failure_limit
-        ):
-            site_attempts += 1
-            candidate = make_site(
-                rng.uniform(min_x, max_x),
-                rng.uniform(min_z, max_z),
-            )
-            if candidate is not None and add_poisson_site(candidate):
-                consecutive_site_failures = 0
-            else:
-                consecutive_site_failures += 1
+        poisson_iterations = 0
+        while poisson_active and len(frontier) < maximum_sites:
+            poisson_iterations += 1
+            active_position = rng.randrange(len(poisson_active))
+            source_site = frontier[poisson_active[active_position]]
+            found_candidate = False
+            for _ in range(30):
+                angle = rng.uniform(0.0, math.pi * 2.0)
+                distance = placement_spacing * rng.uniform(1.0, 2.0)
+                site_u = source_site["site_u"] + math.cos(angle) * distance
+                site_v = source_site["site_v"] + math.sin(angle) * distance
+                candidate = make_site(site_u / scale_x, site_v / scale_z)
+                if candidate is None:
+                    continue
+                candidate_cell = (
+                    int(math.floor(site_u / poisson_cell_size)),
+                    int(math.floor(site_v / poisson_cell_size)),
+                )
+                separated = True
+                for grid_u in range(candidate_cell[0] - 2, candidate_cell[0] + 3):
+                    for grid_v in range(candidate_cell[1] - 2, candidate_cell[1] + 3):
+                        neighbor_index = poisson_grid.get((grid_u, grid_v))
+                        if neighbor_index is None:
+                            continue
+                        neighbor = frontier[neighbor_index]
+                        delta_u = site_u - neighbor["site_u"]
+                        delta_v = site_v - neighbor["site_v"]
+                        if delta_u * delta_u + delta_v * delta_v < placement_spacing ** 2:
+                            separated = False
+                            break
+                    if not separated:
+                        break
+                if not separated:
+                    continue
+                frontier.append(candidate)
+                new_index = len(frontier) - 1
+                poisson_active.append(new_index)
+                poisson_grid[candidate_cell] = new_index
+                found_candidate = True
+                break
+
+            if not found_candidate:
+                poisson_active[active_position] = poisson_active[-1]
+                poisson_active.pop()
 
             if (
                 len(frontier) - last_site_progress >= site_update_interval
@@ -875,126 +886,18 @@ def build_sand_heap():
                     ),
                 )
                 last_site_progress = len(frontier)
-            if site_attempts % 256 == 0 and progress.cancel_requested():
+            if poisson_iterations % 32 == 0 and progress.cancel_requested():
                 om.MGlobal.displayWarning(
                     "Sand heap rebuild cancelled; existing output kept."
                 )
                 return None
 
-        if not frontier:
-            raise RuntimeError(
-                "The footprint/profile has no sites with enough height for the "
-                "current grain size. Increase heap height or reduce grain size."
-            )
-
-        # Aggregate physical capacity into radial bands, then find the smallest
-        # occupied extent whose smoothly faded capacity can hold the requested
-        # material. Smaller grains at a fixed count therefore make one smaller
-        # pile rather than many disconnected islands across the full controller.
-        density_bands = [[] for _ in range(density_band_count)]
-        band_capacities = [0] * density_band_count
-        for site in frontier:
-            band_index = min(
-                int(site["radius_fraction"] * density_band_count),
-                density_band_count - 1,
-            )
-            site["band"] = band_index
-            density_bands[band_index].append(site)
-            band_capacities[band_index] += site["layer_capacity"]
-
-        effective_band = density_band_count - 1
-        desired_band_capacities = [0.0] * density_band_count
-        desired_total = 0.0
-        for extent_band in range(density_band_count):
-            extent_denominator = max(extent_band, 1)
-            trial_capacities = [0.0] * density_band_count
-            trial_total = 0.0
-            for band_index in range(extent_band + 1):
-                normalized_radius = band_index / float(extent_denominator)
-                capacity = (
-                    band_capacities[band_index]
-                    * density_weight(normalized_radius)
-                )
-                trial_capacities[band_index] = capacity
-                trial_total += capacity
-            desired_band_capacities = trial_capacities
-            desired_total = trial_total
-            effective_band = extent_band
-            if desired_total >= count:
-                break
-
-        if desired_total <= 0.0:
-            raise RuntimeError(
-                "The density controls leave no active grain capacity. Reduce "
-                "Density Strength or move Fade Start outward."
-            )
-
-        density_target_count = min(count, int(math.floor(desired_total)))
-        if density_target_count < 1:
-            density_target_count = 1
-        quota_scale = min(density_target_count / desired_total, 1.0)
-        raw_quotas = [capacity * quota_scale for capacity in desired_band_capacities]
-        band_quotas = [int(math.floor(value)) for value in raw_quotas]
-        quota_remainder = density_target_count - sum(band_quotas)
-        remainder_bands = [
-            band_index
-            for band_index in range(effective_band + 1)
-            if band_quotas[band_index] < band_capacities[band_index]
-            and raw_quotas[band_index] - band_quotas[band_index] > 0.0
-        ]
-        while quota_remainder > 0 and remainder_bands:
-            total_remainder_weight = sum(
-                raw_quotas[band_index] - band_quotas[band_index]
-                for band_index in remainder_bands
-            )
-            if total_remainder_weight <= 1.0e-12:
-                break
-            threshold = rng.random() * total_remainder_weight
-            cumulative = 0.0
-            chosen_position = 0
-            for position, band_index in enumerate(remainder_bands):
-                cumulative += raw_quotas[band_index] - band_quotas[band_index]
-                if cumulative >= threshold:
-                    chosen_position = position
-                    break
-            chosen_band = remainder_bands.pop(chosen_position)
-            band_quotas[chosen_band] += 1
-            quota_remainder -= 1
-
-        # Allocate each band's quota one physical layer at a time. Sparse outer
-        # bands select isolated blue-noise sites, while dense inner bands fill a
-        # complete base layer before receiving stacked uses.
-        for band_index in range(effective_band + 1):
-            remaining_quota = band_quotas[band_index]
-            layer_index = 0
-            band_sites = density_bands[band_index]
-            while remaining_quota > 0:
-                layer_sites = [
-                    site
-                    for site in band_sites
-                    if site["layer_capacity"] > layer_index
-                ]
-                if not layer_sites:
-                    break
-                rng.shuffle(layer_sites)
-                layer_count = min(remaining_quota, len(layer_sites))
-                for site in layer_sites[:layer_count]:
-                    site["max_uses"] += 1
-                remaining_quota -= layer_count
-                layer_index += 1
-
-        effective_radius = max(
-            (effective_band + 1) / float(density_band_count),
-            1.0 / density_band_count,
-        )
         frontier = [site for site in frontier if site["max_uses"] > 0]
-        for site in frontier:
-            site["active_radius"] = min(
-                site["radius_fraction"] / effective_radius, 1.0
-            )
         if not frontier:
             raise RuntimeError(
-                "The annular density quotas produced no active placement sites."
+                "The footprint/falloff/density has no active capacity for the "
+                "current grain size. Increase heap height, reduce grain size, "
+                "or reduce radial density falloff."
             )
         rng.shuffle(frontier)
 
@@ -1272,10 +1175,7 @@ def build_sand_heap():
                 proposal_score = (
                     balance_weight
                     * rng.random()
-                    / (
-                        ((1.0 + proposal["uses"]) ** 1.5)
-                        * (1.0 + proposal["active_radius"] * 2.0)
-                    )
+                    / ((1.0 + proposal["uses"]) ** 1.5)
                 )
                 if proposal_score > best_site_score:
                     site_index = proposal_index
@@ -1569,9 +1469,6 @@ def build_sand_heap():
             message += "; composite target detected ({:,} shells)".format(
                 target_shell_count
             )
-        message += "; occupied radial extent {:.0f}%".format(
-            effective_radius * 100.0
-        )
         if auto_increment_seed:
             message += "; next seed is {}".format(next_seed)
         if len(grains) < count:
@@ -1613,27 +1510,11 @@ def _set_rotation_variance(value):
         )
 
 
-def _set_radial_density_strength(value):
-    if cmds.objExists(SIZE_CTRL + ".radialDensityStrength"):
+def _set_radial_density_falloff(value):
+    if cmds.objExists(SIZE_CTRL + ".radialDensityFalloff"):
         cmds.setAttr(
-            SIZE_CTRL + ".radialDensityStrength",
-            max(0.0, min(float(value), 1.0)),
-        )
-
-
-def _set_radial_density_fade_start(value):
-    if cmds.objExists(SIZE_CTRL + ".radialDensityFadeStart"):
-        cmds.setAttr(
-            SIZE_CTRL + ".radialDensityFadeStart",
-            max(0.0, min(float(value), 0.95)),
-        )
-
-
-def _set_radial_density_fade_shape(value):
-    if cmds.objExists(SIZE_CTRL + ".radialDensityFadeShape"):
-        cmds.setAttr(
-            SIZE_CTRL + ".radialDensityFadeShape",
-            max(0.25, min(float(value), 4.0)),
+            SIZE_CTRL + ".radialDensityFalloff",
+            max(0.0, float(value)),
         )
 
 
@@ -1747,15 +1628,10 @@ def _show_control_window():
     grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
-    radial_density_strength = float(
-        cmds.getAttr(SIZE_CTRL + ".radialDensityStrength")
+    radial_density_falloff = float(
+        cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
-    radial_density_fade_start = float(
-        cmds.getAttr(SIZE_CTRL + ".radialDensityFadeStart")
-    )
-    radial_density_fade_shape = float(
-        cmds.getAttr(SIZE_CTRL + ".radialDensityFadeShape")
-    )
+    density_slider_max = max(8.0, radial_density_falloff * 2.0)
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
     auto_increment_seed = bool(
         cmds.getAttr(SIZE_CTRL + ".autoIncrementSeed")
@@ -1778,7 +1654,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 920),
+        widthHeight=(420, 860),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1839,43 +1715,17 @@ def _show_control_window():
         changeCommand=_set_rotation_variance,
     )
     cmds.floatSliderGrp(
-        label="Density Strength",
+        label="Radial Density Falloff",
         field=True,
         minValue=0.0,
-        maxValue=1.0,
+        maxValue=density_slider_max,
         fieldMinValue=0.0,
-        fieldMaxValue=1.0,
-        value=radial_density_strength,
-        step=0.01,
+        fieldMaxValue=1.0e12,
+        value=radial_density_falloff,
+        step=0.1,
         precision=2,
-        dragCommand=_set_radial_density_strength,
-        changeCommand=_set_radial_density_strength,
-    )
-    cmds.floatSliderGrp(
-        label="Density Fade Start",
-        field=True,
-        minValue=0.0,
-        maxValue=0.95,
-        fieldMinValue=0.0,
-        fieldMaxValue=0.95,
-        value=radial_density_fade_start,
-        step=0.01,
-        precision=2,
-        dragCommand=_set_radial_density_fade_start,
-        changeCommand=_set_radial_density_fade_start,
-    )
-    cmds.floatSliderGrp(
-        label="Density Fade Shape",
-        field=True,
-        minValue=0.25,
-        maxValue=4.0,
-        fieldMinValue=0.25,
-        fieldMaxValue=4.0,
-        value=radial_density_fade_shape,
-        step=0.05,
-        precision=2,
-        dragCommand=_set_radial_density_fade_shape,
-        changeCommand=_set_radial_density_fade_shape,
+        dragCommand=_set_radial_density_falloff,
+        changeCommand=_set_radial_density_falloff,
     )
     cmds.intSliderGrp(
         SEED_SLIDER,
