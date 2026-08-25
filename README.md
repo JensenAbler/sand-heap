@@ -114,6 +114,21 @@ shown in the control window and then advances it for the next run. Disable the
 option to reproduce a particular arrangement. Cancelled or failed rebuilds do
 not advance the seed.
 
+## Creasing a baked heap for subdivision
+
+Smooth subdivision averages the grains' craggy silhouettes into blobs unless
+the subdivider is told which features to keep. After a build, run
+[`maya_crease_grains.py`](maya_crease_grains.py) to crease the baked heap's
+edges. Its default `angle` mode maps each edge's dihedral angle onto a
+semi-sharp crease weight, so strong crags stay crisp for the first
+subdivision levels while shallow facets round off - angular but slightly
+worn, like real grains. A `uniform` mode creases every edge equally instead.
+The script enables the viewport smooth preview, which honors the creases, as
+do polySmooth with the OpenSubdiv method and render-time subdivision. It runs
+on the first selected mesh or on `sandHeap_GEO` when nothing is selected, and
+rebuilding the heap replaces the output mesh, so re-run the crease script
+after each rebuild.
+
 ## Performance
 
 The script converts both controller curves into constant-time lookup tables,
