@@ -748,11 +748,6 @@ def build_sand_heap():
                 (1.0 - radius_fraction) ** radial_density_falloff,
                 1.0e-12,
             )
-            # Thin the sites themselves. Capacity caps and selection bias only
-            # reorder how a fixed grain count fills in, so on their own they
-            # leave the finished heap looking uniform at every falloff value.
-            if radial_density_falloff > 0.0 and rng.random() > density_weight:
-                return None
             # Density is a capacity multiplier, not merely a selection bias.
             # Once a site's allowance is consumed it leaves the frontier, so a
             # requested fixed count cannot refill a thinned edge later.
@@ -856,6 +851,17 @@ def build_sand_heap():
                 )
                 return None
 
+        # Rejecting candidates during blue-noise growth cannot thin coverage:
+        # the loop retries until the plane saturates at the separation limit,
+        # so a fresh candidate always backfills a rejected one. Density has to
+        # be applied to the finished site set instead — one keep/discard draw
+        # per site, with nothing refilling the gaps it opens.
+        if radial_density_falloff > 0.0:
+            frontier = [
+                site
+                for site in frontier
+                if rng.random() <= site["density_weight"]
+            ]
         if not frontier:
             raise RuntimeError(
                 "The footprint/falloff has no room for the current grain size. "
