@@ -445,7 +445,9 @@ def _oriented_grain_axes(normal, yaw):
     bitangent = (normal ^ tangent).normalize()
     cosine, sine = math.cos(yaw), math.sin(yaw)
     axis_x = tangent * cosine + bitangent * sine
-    axis_z = tangent * -sine + bitangent * cosine
+    # x-cross-y-equals-z keeps the frame right-handed; a mirrored frame
+    # reverses face winding and inverts every rendered grain normal.
+    axis_z = axis_x ^ normal
     return axis_x.normalize(), normal, axis_z.normalize()
 
 
@@ -489,9 +491,11 @@ def _octahedron():
         (0.0, 0.0, -1.0),
         (0.0, -1.0, 0.0),
     ]
+    # Wound counterclockwise from outside, matching the icosahedron, so the
+    # right-hand rule yields outward normals.
     faces = [
-        (0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 1),
-        (5, 2, 1), (5, 3, 2), (5, 4, 3), (5, 1, 4),
+        (0, 2, 1), (0, 3, 2), (0, 4, 3), (0, 1, 4),
+        (5, 1, 2), (5, 2, 3), (5, 3, 4), (5, 4, 1),
     ]
     return vertices, faces
 
