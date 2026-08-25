@@ -55,6 +55,7 @@ so it does not need to remain selected.
 | `useWorldGravity` | Settle vertically in world space instead of along the controller normal |
 | `proposalBatchSize` | Number of randomized active sites compared per placement |
 | `highDetailGrains` | Use 20-face grains instead of the faster 8-face grains |
+| `subdivideGrainCage` | Subdivide the grain cage once before displacement for craggier grains |
 | `softEdges` | Run Maya's soft-edge operation on the combined output |
 | `showProgress` | Show interruptible progress windows for each build phase |
 
@@ -73,6 +74,13 @@ near-perfect sphere, this is what keeps grains looking like uneven pebbles
 rather than identical blobs when the output is smoothed or subdivided. `0`
 restores the shared regular cage. Placement contacts use each grain's actual
 displaced vertices, so irregular grains still pack without gaps.
+
+**Subdivide grain cage** midpoint-subdivides the base polyhedron once before
+the per-vertex displacement is applied, giving the displacement roughly four
+times as many vertices to work with. Grains come out craggier and hold more
+silhouette detail under further smoothing, at about four times the face count
+(80 faces per high-detail grain, 32 per low-detail grain) and a slower
+placement pass, since contact offsets max over the denser cage.
 
 Radial density falloff is independent of the profile curve. `0` leaves every
 viable site's carrying capacity unchanged; larger values progressively reduce

@@ -231,6 +231,7 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "useWorldGravity", "bool", 1)
     _add_attr(SIZE_CTRL, "proposalBatchSize", "long", 4, 1, 16)
     _add_attr(SIZE_CTRL, "highDetailGrains", "bool", 1)
+    _add_attr(SIZE_CTRL, "subdivideGrainCage", "bool", 0)
     _add_attr(SIZE_CTRL, "softEdges", "bool", 1)
     _add_attr(SIZE_CTRL, "showProgress", "bool", 1)
     if quality_upgrade:
@@ -501,8 +502,41 @@ def _octahedron():
     return vertices, faces
 
 
-def _grain_polyhedron(high_detail):
-    return _icosahedron() if high_detail else _octahedron()
+def _subdivided_once(vertices, faces):
+    """Midpoint-subdivide a triangulated polyhedron onto the unit sphere."""
+    vertices = list(vertices)
+    midpoint_cache = {}
+
+    def midpoint(a, b):
+        key = (a, b) if a < b else (b, a)
+        cached = midpoint_cache.get(key)
+        if cached is not None:
+            return cached
+        mid = tuple(
+            (ca + cb) * 0.5 for ca, cb in zip(vertices[a], vertices[b])
+        )
+        length = math.sqrt(sum(component * component for component in mid))
+        vertices.append(tuple(component / length for component in mid))
+        midpoint_cache[key] = len(vertices) - 1
+        return midpoint_cache[key]
+
+    new_faces = []
+    for a, b, c in faces:
+        ab, bc, ca = midpoint(a, b), midpoint(b, c), midpoint(c, a)
+        new_faces.extend(
+            [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+        )
+    return vertices, new_faces
+
+
+def _grain_polyhedron(high_detail, subdivide_cage=False):
+    vertices, faces = _icosahedron() if high_detail else _octahedron()
+    if subdivide_cage:
+        # A denser cage gives the per-vertex displacement more degrees of
+        # freedom, so grains come out craggier and hold more silhouette
+        # detail under further subdivision.
+        vertices, faces = _subdivided_once(vertices, faces)
+    return vertices, faces
 
 
 def _irregular_grain_vertices(base_vertices, axis_extents, irregularity, rng):
@@ -539,8 +573,8 @@ def _make_material():
         cmds.connectAttr(MATERIAL + ".outColor", SHADING_GROUP + ".surfaceShader", force=True)
 
 
-def _build_mesh(grains, high_detail, soften_edges, progress):
-    _, base_faces = _grain_polyhedron(high_detail)
+def _build_mesh(grains, high_detail, subdivide_cage, soften_edges, progress):
+    _, base_faces = _grain_polyhedron(high_detail, subdivide_cage)
     vertices = []
     counts = []
     connections = []
@@ -644,6 +678,7 @@ def build_sand_heap():
     use_world_gravity = bool(cmds.getAttr(SIZE_CTRL + ".useWorldGravity"))
     proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
+    subdivide_cage = bool(cmds.getAttr(SIZE_CTRL + ".subdivideGrainCage"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
     show_progress = bool(cmds.getAttr(SIZE_CTRL + ".showProgress"))
     rng = random.Random(seed)
@@ -716,7 +751,7 @@ def build_sand_heap():
         projection_cell_size = max(grain_size * 1.25, 1.0e-6)
         cache_reuse_radius_sq = (grain_size * 0.45) ** 2
         minimum_support_normal = math.cos(math.radians(max_support_slope))
-        base_vertices, _ = _grain_polyhedron(high_detail)
+        base_vertices, _ = _grain_polyhedron(high_detail, subdivide_cage)
         axis_extents = tuple(
             max(abs(vertex[axis]) for vertex in base_vertices)
             for axis in range(3)
@@ -1438,6 +1473,7 @@ def build_sand_heap():
         output = _build_mesh(
             grains,
             high_detail=high_detail,
+            subdivide_cage=subdivide_cage,
             soften_edges=soften_edges,
             progress=progress,
         )
@@ -1619,6 +1655,11 @@ def _set_high_detail(value):
         cmds.setAttr(SIZE_CTRL + ".highDetailGrains", bool(value))
 
 
+def _set_subdivide_cage(value):
+    if cmds.objExists(SIZE_CTRL + ".subdivideGrainCage"):
+        cmds.setAttr(SIZE_CTRL + ".subdivideGrainCage", bool(value))
+
+
 def _set_soft_edges(value):
     if cmds.objExists(SIZE_CTRL + ".softEdges"):
         cmds.setAttr(SIZE_CTRL + ".softEdges", bool(value))
@@ -1664,6 +1705,7 @@ def _show_control_window():
     proposal_batch_size = int(cmds.getAttr(SIZE_CTRL + ".proposalBatchSize"))
     use_projection_cache = bool(cmds.getAttr(SIZE_CTRL + ".useProjectionCache"))
     high_detail = bool(cmds.getAttr(SIZE_CTRL + ".highDetailGrains"))
+    subdivide_cage = bool(cmds.getAttr(SIZE_CTRL + ".subdivideGrainCage"))
     soften_edges = bool(cmds.getAttr(SIZE_CTRL + ".softEdges"))
     show_progress = bool(cmds.getAttr(SIZE_CTRL + ".showProgress"))
     slider_max = max(grain_size * 4.0, 0.1)
@@ -1672,7 +1714,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 900),
+        widthHeight=(420, 930),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -1879,6 +1921,11 @@ def _show_control_window():
         label="High-detail grains (20 faces instead of 8)",
         value=high_detail,
         changeCommand=_set_high_detail,
+    )
+    cmds.checkBox(
+        label="Subdivide grain cage once (craggier grains, 4x faces)",
+        value=subdivide_cage,
+        changeCommand=_set_subdivide_cage,
     )
     cmds.checkBox(
         label="Soften grain edges",
