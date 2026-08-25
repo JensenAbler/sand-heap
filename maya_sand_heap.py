@@ -212,7 +212,17 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "maxFailedPlacements", "long", 3000, 100, 1000000)
     _add_attr(SIZE_CTRL, "useProjectionCache", "bool", 1)
     quality_upgrade = not cmds.objExists(SIZE_CTRL + ".packingTightness")
-    _add_attr(SIZE_CTRL, "packingTightness", "double", 0.94, 0.80, 1.05)
+    _add_attr(SIZE_CTRL, "packingTightness", "double", 0.94, 0.25, 1.05)
+    # Earlier releases clamped packing at 0.80. Relax the floor in-place so
+    # controllers saved by those releases accept looser packing too.
+    try:
+        cmds.addAttr(
+            SIZE_CTRL + ".packingTightness",
+            edit=True,
+            minValue=0.25,
+        )
+    except RuntimeError:
+        pass
     _add_attr(SIZE_CTRL, "settlingIterations", "long", 5, 0, 20)
     _add_attr(SIZE_CTRL, "settlingRadius", "double", 1.25, 0.0, 4.0)
     _add_attr(SIZE_CTRL, "maxSupportSlope", "double", 60.0, 0.0, 89.0)
@@ -738,6 +748,11 @@ def build_sand_heap():
                 (1.0 - radius_fraction) ** radial_density_falloff,
                 1.0e-12,
             )
+            # Thin the sites themselves. Capacity caps and selection bias only
+            # reorder how a fixed grain count fills in, so on their own they
+            # leave the finished heap looking uniform at every falloff value.
+            if radial_density_falloff > 0.0 and rng.random() > density_weight:
+                return None
             # Density is a capacity multiplier, not merely a selection bias.
             # Once a site's allowance is consumed it leaves the frontier, so a
             # requested fixed count cannot refill a thinned edge later.
@@ -1491,7 +1506,7 @@ def _set_packing_tightness(value):
     if cmds.objExists(SIZE_CTRL + ".packingTightness"):
         cmds.setAttr(
             SIZE_CTRL + ".packingTightness",
-            max(0.80, min(float(value), 1.05)),
+            max(0.25, min(float(value), 1.05)),
         )
 
 
@@ -1708,9 +1723,9 @@ def _show_control_window():
     cmds.floatSliderGrp(
         label="Packing",
         field=True,
-        minValue=0.80,
+        minValue=0.25,
         maxValue=1.05,
-        fieldMinValue=0.80,
+        fieldMinValue=0.25,
         fieldMaxValue=1.05,
         value=packing_tightness,
         step=0.01,
