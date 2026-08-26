@@ -45,7 +45,7 @@ so it does not need to remain selected.
 | `outerHaloOnly` | Generate only the halo and skip the original interior heap |
 | `outerHaloOffset` | Move the halo start inward (negative) or outward (positive) in footprint radii |
 | `outerHaloExtent` | Set the halo's radial width in footprint radii |
-| `outerHaloDensity` | Unbounded occupancy strength at the inner edge of the outer halo |
+| `outerHaloDensity` | Unbounded surface-site density at the inner edge of the outer halo |
 | `outerHaloFalloff` | Shape how quickly halo occupancy fades toward its outer edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
 | `seed` | Random seed used by the next rebuild |
@@ -105,8 +105,12 @@ surface layer inward over the original footprint. **Halo Extent** sets the width
 from that starting radius. Halo grains are restricted to direct terrain contact
 and cannot stack. **Halo Density** sets occupancy at the annulus's inner edge,
 while **Halo Falloff** shapes its fade to zero across the requested width. Halo
-density has no hard maximum: values above `1` keep progressively more of the
-annulus at full blue-noise occupancy before the outer fade begins thinning it.
+density has no hard maximum. Values up to `1` thin a base blue-noise site set;
+values above `1` create proportionally more candidates with closer spacing.
+Halo grains remain terrain-bound and may overlap other halo grains at high
+density, allowing the control to reach complete visible ground coverage without
+turning the halo into a stacked second layer. They still respect collisions with
+the original interior heap.
 Enable **Generate halo only** to skip the interior site-generation and deposition
 phases entirely. In that mode `grainCount`, the height-profile curve, and radial
 density falloff do not contribute geometry; the output contains only the

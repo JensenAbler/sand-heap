@@ -229,6 +229,20 @@ def _ensure_controls(target_transform):
         )
     except RuntimeError:
         pass
+    # Some Maya versions retain the old numeric maximum even after toggling
+    # hasMaxValue. Verify the legacy plug and give it an effectively open range
+    # if the maximum flag could not be removed cleanly.
+    try:
+        if cmds.attributeQuery(
+            "outerHaloDensity", node=SIZE_CTRL, maxExists=True
+        ):
+            cmds.addAttr(
+                SIZE_CTRL + ".outerHaloDensity",
+                edit=True,
+                maxValue=1.0e100,
+            )
+    except RuntimeError:
+        pass
     _add_attr(SIZE_CTRL, "outerHaloFalloff", "double", 1.5, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "falloffPower", "double", 1.0, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
@@ -1147,9 +1161,12 @@ def build_sand_heap():
                 * scale_z
                 * (outer_radius * outer_radius - inner_radius * inner_radius)
             )
+            density_scale = max(outer_halo_density, 1.0)
+            halo_spacing = placement_spacing / math.sqrt(density_scale)
+            halo_poisson_cell_size = halo_spacing / math.sqrt(2.0)
             candidate_target = min(
-                max(int(halo_world_area / (placement_spacing ** 2) * 1.15), 16),
-                20000,
+                max(int(halo_world_area / (halo_spacing ** 2) * 1.15), 16),
+                100000,
             )
             attempt_limit = max(candidate_target * 50, 2000)
             halo_rng = random.Random(seed ^ 0x5A17C9E3)
@@ -1181,8 +1198,8 @@ def build_sand_heap():
                 site_u = x * scale_x
                 site_v = z * scale_z
                 cell = (
-                    int(math.floor(site_u / poisson_cell_size)),
-                    int(math.floor(site_v / poisson_cell_size)),
+                    int(math.floor(site_u / halo_poisson_cell_size)),
+                    int(math.floor(site_v / halo_poisson_cell_size)),
                 )
                 separated = True
                 for grid_u in range(cell[0] - 2, cell[0] + 3):
@@ -1195,7 +1212,7 @@ def build_sand_heap():
                         delta_v = site_v - neighbor["site_v"]
                         if (
                             delta_u * delta_u + delta_v * delta_v
-                            < placement_spacing ** 2
+                            < halo_spacing ** 2
                         ):
                             separated = False
                             break
@@ -1227,7 +1244,10 @@ def build_sand_heap():
                 halo_fraction = (
                     candidate["radius_fraction"] - inner_radius
                 ) / outer_halo_extent
-                keep_weight = outer_halo_density * (
+                # Candidate spacing already carries density above one. The
+                # remaining probability preserves sub-unit density and applies
+                # the same radial falloff at every density scale.
+                keep_weight = min(outer_halo_density, 1.0) * (
                     max(0.0, 1.0 - halo_fraction) ** outer_halo_falloff
                 )
                 if halo_rng.random() > keep_weight:
@@ -1238,8 +1258,10 @@ def build_sand_heap():
                         "z": candidate["z"],
                         "site_u": candidate["site_u"],
                         "site_v": candidate["site_v"],
-                        # Density is applied once, by thinning the completed
-                        # candidate set. Surviving halo sites are equal peers.
+                        "placement_spacing": halo_spacing,
+                        # Density above one is carried by candidate spacing;
+                        # falloff thinning is already complete, so survivors
+                        # are equal placement peers.
                         "density_weight": 1.0,
                         "max_uses": 1,
                         "sector": radial_sector(candidate["x"], candidate["z"]),
@@ -1442,6 +1464,11 @@ def build_sand_heap():
             for cell_u in range(cell[0] - 1, cell[0] + 2):
                 for cell_v in range(cell[1] - 1, cell[1] + 2):
                     for neighbor in spatial_hash.get((cell_u, cell_v), []):
+                        if halo_only and neighbor.get("halo", False):
+                            # Halo density is an art-directable coverage control.
+                            # At high values, surface grains may overlap each
+                            # other instead of being raised into a second layer.
+                            continue
                         delta_u = projection["u"] - neighbor["u"]
                         delta_v = projection["v"] - neighbor["v"]
                         distance_sq = delta_u * delta_u + delta_v * delta_v
@@ -1609,9 +1636,12 @@ def build_sand_heap():
                     best_site_score = proposal_score
             site = frontier[site_index]
             halo_only = bool(site.get("halo", False))
+            site_placement_spacing = site.get(
+                "placement_spacing", placement_spacing
+            )
             jitter_angle = rng.uniform(0.0, math.pi * 2.0)
             jitter_distance = (
-                placement_spacing * 0.45 * math.sqrt(rng.random())
+                site_placement_spacing * 0.45 * math.sqrt(rng.random())
             )
             x = site["x"] + math.cos(jitter_angle) * jitter_distance / scale_x
             z = site["z"] + math.sin(jitter_angle) * jitter_distance / scale_z
@@ -1851,6 +1881,7 @@ def build_sand_heap():
                     "vertical_support": vertical_support,
                     "axes": axes,
                     "radii": radii,
+                    "halo": halo_only,
                 }
             )
             sector_populations[placement["sector"]] += 1
@@ -2087,10 +2118,24 @@ def _set_outer_halo_offset(value):
 
 def _set_outer_halo_density(value):
     if cmds.objExists(SIZE_CTRL + ".outerHaloDensity"):
-        cmds.setAttr(
-            SIZE_CTRL + ".outerHaloDensity",
-            max(0.0, float(value)),
-        )
+        density = max(0.0, float(value))
+        plug = SIZE_CTRL + ".outerHaloDensity"
+        try:
+            cmds.setAttr(plug, density)
+        except RuntimeError:
+            # Repair controllers created by releases that capped this plug.
+            try:
+                cmds.addAttr(plug, edit=True, hasMaxValue=False)
+            except RuntimeError:
+                pass
+            try:
+                if cmds.attributeQuery(
+                    "outerHaloDensity", node=SIZE_CTRL, maxExists=True
+                ):
+                    cmds.addAttr(plug, edit=True, maxValue=1.0e100)
+            except RuntimeError:
+                pass
+            cmds.setAttr(plug, density)
 
 
 def _set_outer_halo_falloff(value):
