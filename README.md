@@ -40,7 +40,9 @@ so it does not need to remain selected.
 | `grainSizeVariation` | Random size variation |
 | `grainFlattening` | Vertical grain scale |
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
-| `grainIrregularity` | Per-grain random cage displacement for pebble-like variation |
+| `grainIrregularityMin` | Smooth end of the per-grain irregularity range |
+| `grainIrregularity` | Irregular end of the range, shown as **Irregularity Max** |
+| `grainIrregularityBias` | Favor the smooth end (-1), uniform sampling (0), or the irregular end (+1) |
 | `radialDensityFalloff` | Reduce supported grain capacity from the center toward the edge |
 | `outerHaloOnly` | Generate only the halo and skip the original interior heap |
 | `outerHaloOffset` | Move the halo start inward (negative) or outward (positive) in footprint radii |
@@ -73,12 +75,14 @@ scaling, the script uses the geometric mean of those two scale factors for grain
 size. Grain orientation begins at the target normal, receives up to the
 configured rotation variance, and then gets a random yaw.
 
-Grain irregularity gives every grain a unique randomly displaced cage instead
-of a shared regular polyhedron. Because a regular polyhedron subdivides into a
-near-perfect sphere, this is what keeps grains looking like uneven pebbles
-rather than identical blobs when the output is smoothed or subdivided. `0`
-restores the shared regular cage. Placement contacts use each grain's actual
-displaced vertices, so irregular grains still pack without gaps.
+Each grain samples its own amplitude between **Irregularity Min** and
+**Irregularity Max**, then receives a unique randomly displaced cage instead of
+a shared regular polyhedron. **Irregularity Bias** shapes that sampling: `-1`
+strongly favors the smoother end, `0` distributes grains uniformly through the
+range, and `+1` strongly favors the irregular end. Equal minimum and maximum
+values restore the previous fixed-amplitude behavior; a value of `0` restores
+the shared regular cage. Placement contacts use each grain's actual displaced
+vertices, so irregular grains still pack without gaps.
 
 **Cage Subdivisions** adds fractal detail octaves. The coarse cage receives
 the full irregularity amplitude; each subdivision level midpoint-subdivides

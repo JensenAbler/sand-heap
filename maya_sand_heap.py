@@ -33,6 +33,8 @@ MATERIAL = PREFIX + "_MAT"
 SHADING_GROUP = MATERIAL + "SG"
 CONTROL_WINDOW = PREFIX + "_controls_WINDOW"
 SEED_SLIDER = PREFIX + "_seed_SLIDER"
+IRREGULARITY_MIN_SLIDER = PREFIX + "_irregularityMin_SLIDER"
+IRREGULARITY_MAX_SLIDER = PREFIX + "_irregularityMax_SLIDER"
 
 
 class _ProgressWindow(object):
@@ -194,7 +196,19 @@ def _ensure_controls(target_transform):
     _add_attr(SIZE_CTRL, "grainSize", "double", 0.16, 0.001, 10000.0)
     _add_attr(SIZE_CTRL, "grainSizeVariation", "double", 0.30, 0.0, 0.95)
     _add_attr(SIZE_CTRL, "grainFlattening", "double", 0.68, 0.1, 2.0)
+    irregularity_range_upgrade = not cmds.objExists(
+        SIZE_CTRL + ".grainIrregularityMin"
+    )
     _add_attr(SIZE_CTRL, "grainIrregularity", "double", 0.35, 0.0, 0.6)
+    _add_attr(SIZE_CTRL, "grainIrregularityMin", "double", 0.0, 0.0, 0.6)
+    _add_attr(SIZE_CTRL, "grainIrregularityBias", "double", 0.0, -1.0, 1.0)
+    if irregularity_range_upgrade and not created_size:
+        # Preserve existing heaps exactly until the artist deliberately opens
+        # the new range. New controllers default to a 0.0-0.35 distribution.
+        cmds.setAttr(
+            SIZE_CTRL + ".grainIrregularityMin",
+            float(cmds.getAttr(SIZE_CTRL + ".grainIrregularity")),
+        )
     _add_attr(SIZE_CTRL, "rotationVariance", "double", 12.0, 0.0, 90.0)
     _add_attr(SIZE_CTRL, "radialDensityFalloff", "double", 1.0, 0.0)
     # Older versions imposed an arbitrary maximum of 8. Remove it in-place so
@@ -759,6 +773,22 @@ def _irregular_grain_vertices(
     ]
 
 
+def _sample_grain_irregularity(minimum, maximum, bias, rng):
+    """Sample a range with signed bias toward its smooth or irregular end."""
+    lower, upper = sorted((float(minimum), float(maximum)))
+    if upper - lower < 1.0e-12:
+        # Avoid consuming a random number for migrated fixed-value scenes.
+        return lower
+    bias = max(-1.0, min(float(bias), 1.0))
+    fraction = rng.random()
+    exponent = 1.0 + abs(bias) * 9.0
+    if bias < 0.0:
+        fraction = fraction ** exponent
+    elif bias > 0.0:
+        fraction = 1.0 - (1.0 - fraction) ** exponent
+    return lower + (upper - lower) * fraction
+
+
 def _make_material():
     if not cmds.objExists(MATERIAL):
         cmds.shadingNode("lambert", asShader=True, name=MATERIAL)
@@ -854,7 +884,15 @@ def build_sand_heap():
     base_grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variation = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     flattening = float(cmds.getAttr(SIZE_CTRL + ".grainFlattening"))
-    grain_irregularity = float(cmds.getAttr(SIZE_CTRL + ".grainIrregularity"))
+    grain_irregularity_min = float(
+        cmds.getAttr(SIZE_CTRL + ".grainIrregularityMin")
+    )
+    grain_irregularity_max = float(
+        cmds.getAttr(SIZE_CTRL + ".grainIrregularity")
+    )
+    grain_irregularity_bias = float(
+        cmds.getAttr(SIZE_CTRL + ".grainIrregularityBias")
+    )
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
@@ -1694,13 +1732,19 @@ def build_sand_heap():
                 radius * flattening * axis_extents[1],
                 radius / stretch * axis_extents[2],
             )
-            if grain_irregularity > 0.0:
+            sampled_irregularity = _sample_grain_irregularity(
+                grain_irregularity_min,
+                grain_irregularity_max,
+                grain_irregularity_bias,
+                rng,
+            )
+            if sampled_irregularity > 0.0:
                 shape_vertices = _irregular_grain_vertices(
                     coarse_vertices,
                     coarse_faces,
                     cage_subdivisions,
                     axis_extents,
-                    grain_irregularity,
+                    sampled_irregularity,
                     rng,
                 )
             else:
@@ -1954,7 +1998,9 @@ def build_sand_heap():
                     "grainSize": base_grain_size,
                     "grainSizeVariation": size_variation,
                     "grainFlattening": flattening,
-                    "grainIrregularity": grain_irregularity,
+                    "grainIrregularityMin": grain_irregularity_min,
+                    "grainIrregularityMax": grain_irregularity_max,
+                    "grainIrregularityBias": grain_irregularity_bias,
                     "rotationVariance": rotation_variance,
                     "radialDensityFalloff": radial_density_falloff,
                     "outerHaloOnly": outer_halo_only,
@@ -2081,9 +2127,48 @@ def _set_rotation_variance(value):
 
 def _set_grain_irregularity(value):
     if cmds.objExists(SIZE_CTRL + ".grainIrregularity"):
+        maximum = max(0.0, min(float(value), 0.6))
         cmds.setAttr(
             SIZE_CTRL + ".grainIrregularity",
-            max(0.0, min(float(value), 0.6)),
+            maximum,
+        )
+        if (
+            cmds.objExists(SIZE_CTRL + ".grainIrregularityMin")
+            and cmds.getAttr(SIZE_CTRL + ".grainIrregularityMin") > maximum
+        ):
+            cmds.setAttr(SIZE_CTRL + ".grainIrregularityMin", maximum)
+            try:
+                if cmds.floatSliderGrp(IRREGULARITY_MIN_SLIDER, exists=True):
+                    cmds.floatSliderGrp(
+                        IRREGULARITY_MIN_SLIDER, edit=True, value=maximum
+                    )
+            except RuntimeError:
+                pass
+
+
+def _set_grain_irregularity_min(value):
+    if cmds.objExists(SIZE_CTRL + ".grainIrregularityMin"):
+        minimum = max(0.0, min(float(value), 0.6))
+        cmds.setAttr(SIZE_CTRL + ".grainIrregularityMin", minimum)
+        if (
+            cmds.objExists(SIZE_CTRL + ".grainIrregularity")
+            and cmds.getAttr(SIZE_CTRL + ".grainIrregularity") < minimum
+        ):
+            cmds.setAttr(SIZE_CTRL + ".grainIrregularity", minimum)
+            try:
+                if cmds.floatSliderGrp(IRREGULARITY_MAX_SLIDER, exists=True):
+                    cmds.floatSliderGrp(
+                        IRREGULARITY_MAX_SLIDER, edit=True, value=minimum
+                    )
+            except RuntimeError:
+                pass
+
+
+def _set_grain_irregularity_bias(value):
+    if cmds.objExists(SIZE_CTRL + ".grainIrregularityBias"):
+        cmds.setAttr(
+            SIZE_CTRL + ".grainIrregularityBias",
+            max(-1.0, min(float(value), 1.0)),
         )
 
 
@@ -2264,7 +2349,15 @@ def _show_control_window():
     grain_size = float(cmds.getAttr(SIZE_CTRL + ".grainSize"))
     size_variance = float(cmds.getAttr(SIZE_CTRL + ".grainSizeVariation"))
     rotation_variance = float(cmds.getAttr(SIZE_CTRL + ".rotationVariance"))
-    grain_irregularity = float(cmds.getAttr(SIZE_CTRL + ".grainIrregularity"))
+    grain_irregularity_min = float(
+        cmds.getAttr(SIZE_CTRL + ".grainIrregularityMin")
+    )
+    grain_irregularity_max = float(
+        cmds.getAttr(SIZE_CTRL + ".grainIrregularity")
+    )
+    grain_irregularity_bias = float(
+        cmds.getAttr(SIZE_CTRL + ".grainIrregularityBias")
+    )
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
@@ -2298,7 +2391,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 1100),
+        widthHeight=(420, 1190),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -2359,17 +2452,49 @@ def _show_control_window():
         changeCommand=_set_rotation_variance,
     )
     cmds.floatSliderGrp(
-        label="Grain Irregularity",
+        IRREGULARITY_MIN_SLIDER,
+        label="Irregularity Min",
         field=True,
         minValue=0.0,
         maxValue=0.6,
         fieldMinValue=0.0,
         fieldMaxValue=0.6,
-        value=grain_irregularity,
+        value=grain_irregularity_min,
+        step=0.01,
+        precision=2,
+        dragCommand=_set_grain_irregularity_min,
+        changeCommand=_set_grain_irregularity_min,
+    )
+    cmds.floatSliderGrp(
+        IRREGULARITY_MAX_SLIDER,
+        label="Irregularity Max",
+        field=True,
+        minValue=0.0,
+        maxValue=0.6,
+        fieldMinValue=0.0,
+        fieldMaxValue=0.6,
+        value=grain_irregularity_max,
         step=0.01,
         precision=2,
         dragCommand=_set_grain_irregularity,
         changeCommand=_set_grain_irregularity,
+    )
+    cmds.floatSliderGrp(
+        label="Irregularity Bias",
+        field=True,
+        minValue=-1.0,
+        maxValue=1.0,
+        fieldMinValue=-1.0,
+        fieldMaxValue=1.0,
+        value=grain_irregularity_bias,
+        step=0.05,
+        precision=2,
+        dragCommand=_set_grain_irregularity_bias,
+        changeCommand=_set_grain_irregularity_bias,
+    )
+    cmds.text(
+        label="Irregularity bias: -1 favors smooth grains; +1 favors rough grains.",
+        align="left",
     )
     cmds.floatSliderGrp(
         label="Radial Density Falloff",
