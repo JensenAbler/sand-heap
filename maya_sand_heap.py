@@ -209,6 +209,7 @@ def _ensure_controls(target_transform):
         pass
     # The outer halo is a separate, additive ground layer relative to the footprint.
     # An extent of zero keeps existing scenes and rebuilds exactly halo-free.
+    _add_attr(SIZE_CTRL, "outerHaloOnly", "bool", 0)
     _add_attr(SIZE_CTRL, "outerHaloOffset", "double", 0.0, -1.0, 10.0)
     try:
         cmds.addAttr(
@@ -219,7 +220,15 @@ def _ensure_controls(target_transform):
     except RuntimeError:
         pass
     _add_attr(SIZE_CTRL, "outerHaloExtent", "double", 0.0, 0.0, 10.0)
-    _add_attr(SIZE_CTRL, "outerHaloDensity", "double", 0.20, 0.0, 1.0)
+    _add_attr(SIZE_CTRL, "outerHaloDensity", "double", 0.20, 0.0)
+    try:
+        cmds.addAttr(
+            SIZE_CTRL + ".outerHaloDensity",
+            edit=True,
+            hasMaxValue=False,
+        )
+    except RuntimeError:
+        pass
     _add_attr(SIZE_CTRL, "outerHaloFalloff", "double", 1.5, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "falloffPower", "double", 1.0, 0.05, 20.0)
     _add_attr(SIZE_CTRL, "seed", "long", 12345, 0, 2147483647)
@@ -836,6 +845,7 @@ def build_sand_heap():
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
+    outer_halo_only = bool(cmds.getAttr(SIZE_CTRL + ".outerHaloOnly"))
     outer_halo_offset = float(cmds.getAttr(SIZE_CTRL + ".outerHaloOffset"))
     outer_halo_extent = float(cmds.getAttr(SIZE_CTRL + ".outerHaloExtent"))
     outer_halo_density = float(cmds.getAttr(SIZE_CTRL + ".outerHaloDensity"))
@@ -1011,8 +1021,8 @@ def build_sand_heap():
 
         # A center seed guarantees that very strong radial falloff still has a
         # viable origin from which the blue-noise frontier can grow.
-        first_site = make_site(0.0, 0.0)
-        if first_site is None:
+        first_site = None if outer_halo_only else make_site(0.0, 0.0)
+        if first_site is None and not outer_halo_only:
             for _ in range(2000):
                 first_site = make_site(
                     rng.uniform(min_x, max_x),
@@ -1029,7 +1039,10 @@ def build_sand_heap():
             )
             poisson_grid[first_cell] = 0
 
-        progress.begin_phase(maximum_sites, "Preparing blue-noise placement sites...")
+        if not outer_halo_only:
+            progress.begin_phase(
+                maximum_sites, "Preparing blue-noise placement sites..."
+            )
         site_update_interval = max(maximum_sites // 200, 1)
         last_site_progress = 0
         poisson_iterations = 0
@@ -1099,13 +1112,13 @@ def build_sand_heap():
         # so a fresh candidate always backfills a rejected one. Density has to
         # be applied to the finished site set instead — one keep/discard draw
         # per site, with nothing refilling the gaps it opens.
-        if radial_density_falloff > 0.0:
+        if radial_density_falloff > 0.0 and not outer_halo_only:
             frontier = [
                 site
                 for site in frontier
                 if rng.random() <= site["density_weight"]
             ]
-        if not frontier:
+        if not frontier and not outer_halo_only:
             raise RuntimeError(
                 "The footprint/falloff has no room for the current grain size. "
                 "Increase heap height or reduce grain size."
@@ -1499,15 +1512,36 @@ def build_sand_heap():
 
         attempts = 0
         consecutive_failures = 0
-        max_total_attempts = max(count * 40 + len(frontier) * 10, 10000)
-        progress.begin_phase(count, "Dropping and settling grains...")
-        progress_update_interval = max(count // 200, 1)
-        last_progress_update = time.perf_counter()
-        placement_target = count
         phase_start_count = 0
-        halo_phase = False
         interior_grain_count = 0
         halo_grain_count = 0
+        if outer_halo_only:
+            halo_frontier = build_outer_halo_sites()
+            if halo_frontier is None:
+                om.MGlobal.displayWarning(
+                    "Sand heap rebuild cancelled; existing output kept."
+                )
+                return None
+            if not halo_frontier:
+                raise RuntimeError(
+                    "Halo-only generation produced no sites. Increase Halo "
+                    "Extent or Density, or reduce Grain Size."
+                )
+            frontier = halo_frontier
+            halo_phase = True
+            placement_target = len(frontier)
+            max_total_attempts = max(len(frontier) * 40, 10000)
+            progress.begin_phase(
+                len(frontier), "Scattering outer halo grains..."
+            )
+            progress_update_interval = max(len(frontier) // 200, 1)
+        else:
+            halo_phase = False
+            placement_target = count
+            max_total_attempts = max(count * 40 + len(frontier) * 10, 10000)
+            progress.begin_phase(count, "Dropping and settling grains...")
+            progress_update_interval = max(count // 200, 1)
+        last_progress_update = time.perf_counter()
 
         while True:
             phase_complete = (
@@ -1892,6 +1926,7 @@ def build_sand_heap():
                     "grainIrregularity": grain_irregularity,
                     "rotationVariance": rotation_variance,
                     "radialDensityFalloff": radial_density_falloff,
+                    "outerHaloOnly": outer_halo_only,
                     "outerHaloOffset": outer_halo_offset,
                     "outerHaloExtent": outer_halo_extent,
                     "outerHaloDensity": outer_halo_density,
@@ -1974,7 +2009,7 @@ def build_sand_heap():
             )
         if auto_increment_seed:
             message += "; next seed is {}".format(next_seed)
-        if interior_grain_count < count:
+        if not outer_halo_only and interior_grain_count < count:
             message += (
                 " (requested {:,}; active supported capacity was exhausted)"
             ).format(count)
@@ -2037,6 +2072,11 @@ def _set_outer_halo_extent(value):
         )
 
 
+def _set_outer_halo_only(value):
+    if cmds.objExists(SIZE_CTRL + ".outerHaloOnly"):
+        cmds.setAttr(SIZE_CTRL + ".outerHaloOnly", bool(value))
+
+
 def _set_outer_halo_offset(value):
     if cmds.objExists(SIZE_CTRL + ".outerHaloOffset"):
         cmds.setAttr(
@@ -2049,7 +2089,7 @@ def _set_outer_halo_density(value):
     if cmds.objExists(SIZE_CTRL + ".outerHaloDensity"):
         cmds.setAttr(
             SIZE_CTRL + ".outerHaloDensity",
-            max(0.0, min(float(value), 1.0)),
+            max(0.0, float(value)),
         )
 
 
@@ -2183,10 +2223,12 @@ def _show_control_window():
     radial_density_falloff = float(
         cmds.getAttr(SIZE_CTRL + ".radialDensityFalloff")
     )
+    outer_halo_only = bool(cmds.getAttr(SIZE_CTRL + ".outerHaloOnly"))
     outer_halo_offset = float(cmds.getAttr(SIZE_CTRL + ".outerHaloOffset"))
     outer_halo_extent = float(cmds.getAttr(SIZE_CTRL + ".outerHaloExtent"))
     outer_halo_density = float(cmds.getAttr(SIZE_CTRL + ".outerHaloDensity"))
     outer_halo_falloff = float(cmds.getAttr(SIZE_CTRL + ".outerHaloFalloff"))
+    halo_density_slider_max = max(8.0, outer_halo_density * 2.0)
     density_slider_max = max(8.0, radial_density_falloff * 2.0)
     seed = int(cmds.getAttr(SIZE_CTRL + ".seed"))
     auto_increment_seed = bool(
@@ -2211,7 +2253,7 @@ def _show_control_window():
         CONTROL_WINDOW,
         title="Sand Heap Controls",
         sizeable=True,
-        widthHeight=(420, 1065),
+        widthHeight=(420, 1100),
     )
     cmds.columnLayout(adjustableColumn=True, rowSpacing=8, columnOffset=("both", 10))
     cmds.text(
@@ -2302,6 +2344,11 @@ def _show_control_window():
         label="Outer halo (additive surface grains relative to the footprint)",
         align="left",
     )
+    cmds.checkBox(
+        label="Generate halo only (skip interior heap)",
+        value=outer_halo_only,
+        changeCommand=_set_outer_halo_only,
+    )
     cmds.floatSliderGrp(
         label="Halo Offset",
         field=True,
@@ -2332,9 +2379,9 @@ def _show_control_window():
         label="Halo Density",
         field=True,
         minValue=0.0,
-        maxValue=1.0,
+        maxValue=halo_density_slider_max,
         fieldMinValue=0.0,
-        fieldMaxValue=1.0,
+        fieldMaxValue=1.0e100,
         value=outer_halo_density,
         step=0.01,
         precision=2,

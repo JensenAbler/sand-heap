@@ -42,9 +42,10 @@ so it does not need to remain selected.
 | `rotationVariance` | Maximum random tilt away from the target surface normal |
 | `grainIrregularity` | Per-grain random cage displacement for pebble-like variation |
 | `radialDensityFalloff` | Reduce supported grain capacity from the center toward the edge |
+| `outerHaloOnly` | Generate only the halo and skip the original interior heap |
 | `outerHaloOffset` | Move the halo start inward (negative) or outward (positive) in footprint radii |
 | `outerHaloExtent` | Set the halo's radial width in footprint radii |
-| `outerHaloDensity` | Maximum blue-noise occupancy at the inner edge of the outer halo |
+| `outerHaloDensity` | Unbounded occupancy strength at the inner edge of the outer halo |
 | `outerHaloFalloff` | Shape how quickly halo occupancy fades toward its outer edge |
 | `falloffPower` | Additional shaping applied to the falloff curve |
 | `seed` | Random seed used by the next rebuild |
@@ -103,7 +104,13 @@ starting radius relative to the footprint edge: `0` starts at normalized radius
 surface layer inward over the original footprint. **Halo Extent** sets the width
 from that starting radius. Halo grains are restricted to direct terrain contact
 and cannot stack. **Halo Density** sets occupancy at the annulus's inner edge,
-while **Halo Falloff** shapes its fade to zero across the requested width.
+while **Halo Falloff** shapes its fade to zero across the requested width. Halo
+density has no hard maximum: values above `1` keep progressively more of the
+annulus at full blue-noise occupancy before the outer fade begins thinning it.
+Enable **Generate halo only** to skip the interior site-generation and deposition
+phases entirely. In that mode `grainCount`, the height-profile curve, and radial
+density falloff do not contribute geometry; the output contains only the
+terrain-contact halo grains selected by the four halo controls.
 
 Every generated `sandHeap_GEO` stores a human-readable build sheet in its Maya
 **Notes** attribute. It records the seed actually used, all generator parameters,
